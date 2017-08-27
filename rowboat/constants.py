@@ -2,17 +2,17 @@ import re
 from disco.types.user import GameType, Status
 
 # Emojis
-GREEN_TICK_EMOJI_ID = 305231298799206401
-RED_TICK_EMOJI_ID = 305231335512080385
+GREEN_TICK_EMOJI_ID = 347005603828334592
+RED_TICK_EMOJI_ID = 347004829723525130
 GREEN_TICK_EMOJI = 'green_tick:{}'.format(GREEN_TICK_EMOJI_ID)
 RED_TICK_EMOJI = 'red_tick:{}'.format(RED_TICK_EMOJI_ID)
 STAR_EMOJI = u'\U00002B50'
 STATUS_EMOJI = {
-    Status.ONLINE: ':status_online:305889169811439617',
-    Status.IDLE: ':status_away:305889079222992896',
-    Status.DND: ':status_dnd:305889053255925760',
-    Status.OFFLINE: ':status_offline:305889028996071425',
-    GameType.STREAMING: ':status_streaming:305889126463569920',
+    Status.ONLINE: ':status_online:346247554188574720',
+    Status.IDLE: ':status_idle:346247554104557569',
+    Status.DND: ':status_dnd:346247553773469697',
+    Status.OFFLINE: ':status_offline:346247554167603220',
+    GameType.STREAMING: ':status_streaming:347004585329688576',
 }
 
 
