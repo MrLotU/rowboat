@@ -277,7 +277,7 @@ class CorePlugin(Plugin):
         embed.color = 0x779ecb
         yield embed
         self.bot.client.api.channels_messages_create(
-            290924692057882635 if ENV == 'prod' else 301869081714491393,
+            346248432299671553 if ENV == 'prod' else 346248472657395743,
             '',
             embed=embed
         )
