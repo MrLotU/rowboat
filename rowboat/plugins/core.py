@@ -35,7 +35,7 @@ from rowboat.constants import (
 PY_CODE_BLOCK = u'```py\n{}\n```'
 
 BOT_INFO = '''
-Rowboat is a moderation and utilitarian bot built for large Discord servers. Created by **B1nzy#1337**, modified and self-hosted by **LordOfTheUndead#7368**
+Rowboat is a moderation and utilitarian bot built for large Discord servers.
 '''
 
 GUILDS_WAITING_SETUP_KEY = 'gws'
@@ -503,7 +503,7 @@ class CorePlugin(Plugin):
     @Plugin.command('about')
     def command_about(self, event):
         embed = MessageEmbed()
-        embed.set_author(name='Rowboat', icon_url=self.client.state.me.avatar_url, url='https://dashboard.lotu.me/')
+        embed.set_author(name='Rowboat', icon_url=self.client.state.me.avatar_url, url='https://rowboat.party/')
         embed.description = BOT_INFO
         embed.add_field(name='Servers', value=str(Guild.select().count()), inline=True)
         embed.add_field(name='Uptime', value=humanize.naturaldelta(datetime.utcnow() - self.startup), inline=True)
