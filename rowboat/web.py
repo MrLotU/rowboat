@@ -5,9 +5,10 @@ import logging
 from flask import Flask, g, session
 from holster.flask_ext import Holster
 
+from rowboat import ENV
 from rowboat.sql import init_db
 from rowboat.models.user import User
-from rowboat.models.notification import Notification
+from rowboat.types.guild import PluginsConfig
 
 from yaml import load
 
@@ -17,13 +18,16 @@ logging.getLogger('peewee').setLevel(logging.DEBUG)
 
 @rowboat.app.before_first_request
 def before_first_request():
-    init_db()
+    init_db(ENV)
+
+    PluginsConfig.force_load_plugin_configs()
 
     with open('config.yaml', 'r') as f:
         data = load(f)
 
-    rowboat.app.secret_key = data.get('SECRET_KEY')
     rowboat.app.config.update(data['web'])
+    rowboat.app.secret_key = data['web']['SECRET_KEY']
+    rowboat.app.config['token'] = data.get('token')
 
 
 @rowboat.app.before_request
@@ -48,5 +52,4 @@ def save_auth(response):
 def inject_data():
     return dict(
         user=g.user,
-        notifications=[i.to_user() for i in Notification.get_unreads()]
     )

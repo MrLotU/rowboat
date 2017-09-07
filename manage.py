@@ -3,25 +3,33 @@ from gevent import monkey; monkey.patch_all()
 
 from werkzeug.serving import run_with_reloader
 from gevent import wsgi
+from rowboat import ENV
 from rowboat.web import rowboat
+from rowboat.sql import init_db
 from yaml import load
 
 import os
 import copy
-import logging
 import click
-import BaseHTTPServer
+import signal
+import logging
+import gevent
 import subprocess
-
-
-SUPERVISOR = None
 
 
 class BotSupervisor(object):
     def __init__(self, env={}):
         self.proc = None
         self.env = env
+        self.bind_signals()
         self.start()
+
+    def bind_signals(self):
+        signal.signal(signal.SIGUSR1, self.handle_sigusr1)
+
+    def handle_sigusr1(self, signum, frame):
+        print 'SIGUSR1 - RESTARTING'
+        gevent.spawn(self.restart)
 
     def start(self):
         env = copy.deepcopy(os.environ)
@@ -39,14 +47,10 @@ class BotSupervisor(object):
 
         self.start()
 
-
-class RestarterHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-    def do_POST(s):
-        s.send_response(200)
-        s.end_headers()
-
-        subprocess.check_call(['git', 'pull', 'origin', 'master'])
-        SUPERVISOR.restart()
+    def run_forever(self):
+        while True:
+            self.proc.wait()
+            gevent.sleep(5)
 
 
 @click.group()
@@ -69,24 +73,74 @@ def serve(reloader):
 @cli.command()
 @click.option('--env', '-e', default='local')
 def bot(env):
-    global SUPERVISOR
-
     with open('config.yaml', 'r') as f:
         config = load(f)
 
-    SUPERVISOR = BotSupervisor(env={
+    supervisor = BotSupervisor(env={
         'ENV': env,
         'DSN': config['DSN'],
-        'GOOGLE_APPLICATION_CREDENTIALS': config['GOOGLE_APPLICATION_CREDENTIALS'],
     })
-    httpd = BaseHTTPServer.HTTPServer(('0.0.0.0', 8080), RestarterHandler)
+    supervisor.run_forever()
+
+
+@cli.command('add-global-admin')
+@click.argument('user-id')
+def add_global_admin(user_id):
+    from rowboat.redis import rdb
+    from rowboat.models.user import User
+    init_db(ENV)
+    rdb.sadd('global_admins', user_id)
+    User.update(admin=True).where(User.user_id == user_id).execute()
+    print 'Ok, added {} as a global admin'.format(user_id)
+
+
+@cli.command('wh-add')
+@click.argument('guild-id')
+@click.argument('flag')
+def add_whitelist(guild_id, flag):
+    from rowboat.models.guild import Guild
+    init_db(ENV)
+
+    flag = Guild.WhitelistFlags.get(flag)
+    if not flag:
+        print 'Invalid flag'
+        return
 
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        guild = Guild.get(guild_id=guild_id)
+    except Guild.DoesNotExist:
+        print 'No guild exists with that id'
+        return
 
-    httpd.server_close()
+    guild.whitelist.append(int(flag))
+    guild.save()
+    guild.emit_update()
+    print 'added flag'
+
+
+@cli.command('wh-rmv')
+@click.argument('guild-id')
+@click.argument('flag')
+def rmv_whitelist(guild_id, flag):
+    from rowboat.models.guild import Guild
+    init_db(ENV)
+
+    flag = Guild.WhitelistFlags.get(flag)
+    if not flag:
+        print 'Invalid flag'
+        return
+
+    try:
+        guild = Guild.get(guild_id=guild_id)
+    except Guild.DoesNotExist:
+        print 'No guild exists with that id'
+        return
+
+    guild.whitelist.remove(int(flag))
+    guild.save()
+    guild.emit_update()
+    print 'removed flag'
+
 
 if __name__ == '__main__':
     cli()

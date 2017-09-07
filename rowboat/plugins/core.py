@@ -1,88 +1,193 @@
 import os
 import json
+import gevent
 import pprint
+import signal
+import inspect
 import humanize
 import functools
-import inspect
+import contextlib
 
 from datetime import datetime, timedelta
-from holster.emitter import Priority
+from holster.emitter import Priority, Emitter
+from disco.bot import Bot
 from disco.types.message import MessageEmbed
 from disco.api.http import APIException
 from disco.bot.command import CommandEvent
+from disco.util.sanitize import S
 
-from rowboat.util import C, LocalProxy
+from rowboat import ENV
+from rowboat.util import LocalProxy
+from rowboat.util.stats import timed
 from rowboat.plugins import BasePlugin as Plugin
-from rowboat.plugins import RowboatPlugin
+from rowboat.plugins import CommandResponse
 from rowboat.sql import init_db
 from rowboat.redis import rdb
-from rowboat.models.user import Infraction
+
+import rowboat.models
 from rowboat.models.guild import Guild, GuildBan
+from rowboat.models.message import Command
 from rowboat.models.notification import Notification
 from rowboat.plugins.modlog import Actions
-
-ENV = os.getenv('ENV', 'local')
+from rowboat.constants import (
+    GREEN_TICK_EMOJI, RED_TICK_EMOJI, ROWBOAT_GUILD_ID, ROWBOAT_USER_ROLE_ID
+)
 
 PY_CODE_BLOCK = u'```py\n{}\n```'
 
 BOT_INFO = '''
-Rowboat is a moderation and utilitarian Bot built for large Discord servers.
+Rowboat is a moderation and utilitarian bot built for large Discord servers.
 '''
+
+GUILDS_WAITING_SETUP_KEY = 'gws'
 
 
 class CorePlugin(Plugin):
     def load(self, ctx):
-        init_db()
+        init_db(ENV)
 
         self.startup = ctx.get('startup', datetime.utcnow())
         self.guilds = ctx.get('guilds', {})
 
+        self.emitter = Emitter(gevent.spawn)
+
         super(CorePlugin, self).load(ctx)
 
-        for plugin in self.bot.plugins.values():
-            if not isinstance(plugin, RowboatPlugin):
-                continue
+        # Overwrite the main bot instances plugin loader so we can magicfy events
+        self.bot.add_plugin = self.our_add_plugin
 
-            plugin.register_trigger('command', 'pre', functools.partial(self.on_pre, plugin))
-            plugin.register_trigger('listener', 'pre', functools.partial(self.on_pre, plugin))
+        if ENV != 'prod':
+            self.spawn(self.wait_for_plugin_changes)
 
-        self.spawn(self.wait_for_updates)
-        self.spawn(self.wait_for_dispatches)
+        self._wait_for_actions_greenlet = self.spawn(self.wait_for_actions)
 
-    def wait_for_dispatches(self):
+    def spawn_wait_for_actions(self, *args, **kwargs):
+        self._wait_for_actions_greenlet = self.spawn(self.wait_for_actions)
+        self._wait_for_actions_greenlet.link_exception(self.spawn_wait_for_actions)
+
+    def our_add_plugin(self, cls, *args, **kwargs):
+        if getattr(cls, 'global_plugin', False):
+            Bot.add_plugin(self.bot, cls, *args, **kwargs)
+            return
+
+        inst = cls(self.bot, None)
+        inst.register_trigger('command', 'pre', functools.partial(self.on_pre, inst))
+        inst.register_trigger('listener', 'pre', functools.partial(self.on_pre, inst))
+        Bot.add_plugin(self.bot, inst, *args, **kwargs)
+
+    def wait_for_plugin_changes(self):
+        import gevent_inotifyx as inotify
+
+        fd = inotify.init()
+        inotify.add_watch(fd, 'rowboat/plugins/', inotify.IN_MODIFY)
+        while True:
+            events = inotify.get_events(fd)
+            for event in events:
+                # Can't reload core.py sadly
+                if event.name.startswith('core.py'):
+                    continue
+
+                plugin_name = '{}Plugin'.format(event.name.split('.', 1)[0].title())
+                plugin = next((v for k, v in self.bot.plugins.items() if k.lower() == plugin_name.lower()), None)
+                if plugin:
+                    self.log.info('Detected change in %s, reloading...', plugin_name)
+                    try:
+                        plugin.reload()
+                    except Exception:
+                        self.log.exception('Failed to reload: ')
+
+    def wait_for_actions(self):
         ps = rdb.pubsub()
-        ps.subscribe('notifications')
-
-        for item in ps.listen():
-            if item['type'] != 'message':
-                continue
-
-            obj = json.loads(item['data'])
-
-            self.bot.client.api.channels_messages_create(
-                290924692057882635,
-                u'**{}**\n{}'.format(
-                    obj['title'],
-                    obj['content']))
-
-    def wait_for_updates(self):
-        ps = rdb.pubsub()
-        ps.subscribe('guild-updates')
+        ps.subscribe('actions')
 
         for item in ps.listen():
             if item['type'] != 'message':
                 continue
 
             data = json.loads(item['data'])
-            if data['type'] == 'UPDATE' and data['id'] in self.guilds:
-                self.send_control_message(u'Reloaded config for Guild {}'.format(self.guilds[data['id']].name))
-                self.log.info('Reloading config for guild %s', self.guilds[data['id']].name)
-                self.guilds[data['id']].get_config(refresh=True)
+            print data, data['id'], self.guilds
+            if data['type'] == 'GUILD_UPDATE' and data['id'] in self.guilds:
+                with self.send_control_message() as embed:
+                    embed.title = u'Reloaded config for {}'.format(
+                        self.guilds[data['id']].name
+                    )
+
+                self.log.info(u'Reloading guild %s', self.guilds[data['id']].name)
+
+                # Refresh config, mostly to validate
+                try:
+                    config = self.guilds[data['id']].get_config(refresh=True)
+
+                    # Reload the guild entirely
+                    self.guilds[data['id']] = Guild.with_id(data['id'])
+
+                    # Update guild access
+                    self.update_rowboat_guild_access()
+
+                    # Finally, emit the event
+                    self.emitter.emit('GUILD_CONFIG_UPDATE', self.guilds[data['id']], config)
+                except:
+                    self.log.exception(u'Failed to reload config for guild %s', self.guilds[data['id']].name)
+                    continue
+            elif data['type'] == 'RESTART':
+                self.log.info('Restart requested, signaling parent')
+                os.kill(os.getppid(), signal.SIGUSR1)
 
     def unload(self, ctx):
         ctx['guilds'] = self.guilds
         ctx['startup'] = self.startup
         super(CorePlugin, self).unload(ctx)
+
+    def update_rowboat_guild_access(self):
+        if ROWBOAT_GUILD_ID not in self.state.guilds or ENV != 'prod':
+            return
+
+        rb_guild = self.state.guilds.get(ROWBOAT_GUILD_ID)
+        if not rb_guild:
+            return
+
+        self.log.info('Updating rowboat guild access')
+
+        guilds = Guild.select(
+            Guild.guild_id,
+            Guild.config
+        ).where(
+            (Guild.enabled == 1)
+        )
+
+        users_who_should_have_access = set()
+        for guild in guilds:
+            if 'web' not in guild.config:
+                continue
+
+            for user_id in guild.config['web'].keys():
+                try:
+                    users_who_should_have_access.add(int(user_id))
+                except:
+                    self.log.warning('Guild %s has invalid user ACLs: %s', guild.guild_id, guild.config['web'])
+
+        # TODO: sharding
+        users_who_have_access = {
+            i.id for i in rb_guild.members.values()
+            if ROWBOAT_USER_ROLE_ID in i.roles
+        }
+
+        remove_access = set(users_who_have_access) - set(users_who_should_have_access)
+        add_access = set(users_who_should_have_access) - set(users_who_have_access)
+
+        for user_id in remove_access:
+            member = rb_guild.members.get(user_id)
+            if not member:
+                continue
+
+            member.remove_role(ROWBOAT_USER_ROLE_ID)
+
+        for user_id in add_access:
+            member = rb_guild.members.get(user_id)
+            if not member:
+                continue
+
+            member.add_role(ROWBOAT_USER_ROLE_ID)
 
     def on_pre(self, plugin, func, event, args, kwargs):
         """
@@ -95,7 +200,7 @@ class CorePlugin(Plugin):
         elif hasattr(event, 'guild_id') and event.guild_id:
             guild_id = event.guild_id
         else:
-            return
+            guild_id = None
 
         if guild_id not in self.guilds:
             if isinstance(event, CommandEvent):
@@ -107,17 +212,39 @@ class CorePlugin(Plugin):
 
             return
 
+        if hasattr(plugin, 'WHITELIST_FLAG'):
+            if not int(plugin.WHITELIST_FLAG) in self.guilds[guild_id].whitelist:
+                return
+
         event.base_config = self.guilds[guild_id].get_config()
+        if not event.base_config:
+            return
 
         plugin_name = plugin.name.lower().replace('plugin', '')
         if not getattr(event.base_config.plugins, plugin_name, None):
             return
 
+        self._attach_local_event_data(event, plugin_name, guild_id)
+
+        return event
+
+    def get_config(self, guild_id, *args, **kwargs):
+        # Externally Used
+        return self.guilds[guild_id].get_config(*args, **kwargs)
+
+    def get_guild(self, guild_id):
+        # Externally Used
+        return self.guilds[guild_id]
+
+    def _attach_local_event_data(self, event, plugin_name, guild_id):
         if not hasattr(event, 'config'):
             event.config = LocalProxy()
 
+        if not hasattr(event, 'rowboat_guild'):
+            event.rowboat_guild = LocalProxy()
+
         event.config.set(getattr(event.base_config.plugins, plugin_name))
-        return event
+        event.rowboat_guild.set(self.guilds[guild_id])
 
     @Plugin.schedule(290, init=False)
     def update_guild_bans(self):
@@ -151,10 +278,24 @@ class CorePlugin(Plugin):
             (GuildBan.guild_id == event.guild_id)
         )
 
-    def send_control_message(self, content, *args, **kwargs):
-        self.bot.client.api.channels_messages_create(
-            290924692057882635,
-            u'**{}**\n{}'.format('Production' if ENV == 'prod' else 'Local', content), *args, **kwargs)
+    @contextlib.contextmanager
+    def send_control_message(self):
+        embed = MessageEmbed()
+        embed.set_footer(text='Rowboat {}'.format(
+            'Production' if ENV == 'prod' else 'Testing'
+        ))
+        embed.timestamp = datetime.utcnow().isoformat()
+        embed.color = 0x779ecb
+        try:
+            yield embed
+            self.bot.client.api.channels_messages_create(
+                290924692057882635 if ENV == 'prod' else 301869081714491393,
+                '',
+                embed=embed
+            )
+        except:
+            self.log.exception('Failed to send control message:')
+            return
 
     @Plugin.listen('Resumed')
     def on_resumed(self, event):
@@ -164,8 +305,16 @@ class CorePlugin(Plugin):
             env=ENV,
         )
 
-    @Plugin.listen('Ready')
+        with self.send_control_message() as embed:
+            embed.title = 'Resumed'
+            embed.color = 0xffb347
+            embed.add_field(name='Gateway Server', value=event.trace[0], inline=False)
+            embed.add_field(name='Session Server', value=event.trace[1], inline=False)
+            embed.add_field(name='Replayed Events', value=str(self.client.gw.replayed_events))
+
+    @Plugin.listen('Ready', priority=Priority.BEFORE)
     def on_ready(self, event):
+        reconnects = self.client.gw.reconnects
         self.log.info('Started session %s', event.session_id)
         Notification.dispatch(
             Notification.Types.CONNECT,
@@ -173,28 +322,36 @@ class CorePlugin(Plugin):
             env=ENV,
         )
 
-    @Plugin.schedule(1, init=False)
-    def on_fucked_channels(self):
-        for guild in self.state.guilds.values():
-            if not len(guild.channels):
-                self.log.warning('Guild %s (%s) has fucked channels', guild.id, guild.name)
+        with self.send_control_message() as embed:
+            if reconnects:
+                embed.title = 'Reconnected'
+                embed.color = 0xffb347
+            else:
+                embed.title = 'Connected'
+                embed.color = 0x77dd77
 
-    # @Plugin.listen('GuildCreate', conditional=lambda e: e.created is True)
-    # def on_guild_join(self, event):
-    #     self.send_control_message('Added to guild {}: {}'.format(event.guild.id, event.guild.name))
-
-    @Plugin.listen('GuildDelete', conditional=lambda e: e.deleted is True)
-    def on_guild_leave(self, event):
-        self.send_control_message('Removed from guild {}'.format(event.guild.id))
+            embed.add_field(name='Gateway Server', value=event.trace[0], inline=False)
+            embed.add_field(name='Session Server', value=event.trace[1], inline=False)
 
     @Plugin.listen('GuildCreate', priority=Priority.BEFORE, conditional=lambda e: not e.created)
     def on_guild_create(self, event):
         try:
             guild = Guild.with_id(event.id)
         except Guild.DoesNotExist:
+            # If the guild is not awaiting setup, leave it now
+            if not rdb.sismember(GUILDS_WAITING_SETUP_KEY, str(event.id)) and event.id != ROWBOAT_GUILD_ID:
+                self.log.warning(
+                    'Leaving guild %s (%s), not within setup list',
+                    event.id, event.name
+                )
+                event.guild.leave()
             return
 
         if not guild.enabled:
+            return
+
+        config = guild.get_config()
+        if not config:
             return
 
         # Ensure we're updated
@@ -203,12 +360,12 @@ class CorePlugin(Plugin):
 
         self.guilds[event.id] = guild
 
-        if guild.get_config().nickname:
+        if config.nickname:
             def set_nickname():
                 m = event.members.select_one(id=self.state.me.id)
-                if m and m.nick != guild.get_config().nickname:
+                if m and m.nick != config.nickname:
                     try:
-                        m.set_nickname(guild.get_config().nickname)
+                        m.set_nickname(config.nickname)
                     except APIException as e:
                         self.log.warning('Failed to set nickname for guild %s (%s)', event.guild, e.content)
             self.spawn_later(5, set_nickname)
@@ -218,7 +375,7 @@ class CorePlugin(Plugin):
 
         user_level = 0
         if config:
-            member = guild.get_member(user.id)
+            member = guild.get_member(user)
             if not member:
                 return user_level
 
@@ -227,8 +384,8 @@ class CorePlugin(Plugin):
                     user_level = config.levels[oid]
 
             # User ID overrides should override all others
-            if user.id in config.levels:
-                user_level = config.levels[user.id]
+            if member.id in config.levels:
+                user_level = config.levels[member.id]
 
         return user_level
 
@@ -240,9 +397,6 @@ class CorePlugin(Plugin):
         """
         # Ignore messages sent by bots
         if event.message.author.bot:
-            return
-
-        if rdb.sismember('ignored_channels', event.message.channel_id):
             return
 
         # If this is message for a guild, grab the guild object
@@ -257,13 +411,12 @@ class CorePlugin(Plugin):
         config = guild and guild.get_config()
 
         # If the guild has configuration, use that (otherwise use defaults)
-        if config:
-            if config.commands:
-                commands = list(self.bot.get_commands_for_message(
-                    config.commands.mention,
-                    {},
-                    config.commands.prefix,
-                    event.message))
+        if config and config.commands:
+            commands = list(self.bot.get_commands_for_message(
+                config.commands.mention,
+                {},
+                config.commands.prefix,
+                event.message))
         elif guild_id:
             # Otherwise, default to requiring mentions
             commands = list(self.bot.get_commands_for_message(True, {}, '', event.message))
@@ -308,13 +461,27 @@ class CorePlugin(Plugin):
             if not global_admin and event.user_level < level:
                 continue
 
-            command.plugin.execute(CommandEvent(command, event.message, match))
+            with timed('rowboat.command.duration', tags={'plugin': command.plugin.name, 'command': command.name}):
+                try:
+                    command_event = CommandEvent(command, event.message, match)
+                    command_event.user_level = event.user_level
+                    command.plugin.execute(command_event)
+                except CommandResponse as e:
+                    event.reply(e.response)
+                except:
+                    Command.track(event, command, exception=True)
+                    self.log.exception('Command error:')
+                    return event.reply('<:{}> something went wrong, perhaps try again later'.format(RED_TICK_EMOJI))
+
+            Command.track(event, command)
 
             # Dispatch the command used modlog event
             if config:
-                event.config = getattr(config.plugins, 'modlog', None)
-                if not event.config:
+                modlog_config = getattr(config.plugins, 'modlog', None)
+                if not modlog_config:
                     return
+
+                self._attach_local_event_data(event, 'modlog', event.guild.id)
 
                 plugin = self.bot.plugins.get('ModLogPlugin')
                 if plugin:
@@ -324,9 +491,6 @@ class CorePlugin(Plugin):
 
     @Plugin.command('setup')
     def command_setup(self, event):
-        """
-        Setup a new Guild with Rowboat
-        """
         if not event.guild:
             return event.msg.reply(':warning: this command can only be used in servers')
 
@@ -347,58 +511,23 @@ class CorePlugin(Plugin):
             return event.msg.reply(':warning: bot must have the Administrator permission')
 
         guild = Guild.setup(event.guild)
+        rdb.srem(GUILDS_WAITING_SETUP_KEY, str(event.guild.id))
         self.guilds[event.guild.id] = guild
         event.msg.reply(':ok_hand: successfully loaded configuration')
-
-    '''
-    @Plugin.command('help', '<command>')
-    def command_help(self, event, command):
-        """
-        Provides information on a given command.
-        """
-        for cmd in self.bot.commands:
-            if command.lower() in cmd.triggers:
-                break
-        else:
-            event.msg.reply(u"Couldn't find command for `{}`".format(C(command)))
-            return
-
-        event.msg.reply(u'Usage: {} {}\nDescription: {}'.format(
-            command,
-            cmd.raw_args or '',
-            cmd.func.__doc__,
-        ))
-    '''
-
-    @Plugin.command('nuke', '<user:snowflake> <reason:str...>', level=-1)
-    def nuke(self, event, user, reason):
-        """
-        Force ban a user from all rowboat Guilds
-        """
-        for gid, guild in self.guilds.items():
-            try:
-                Infraction.ban(
-                    self,
-                    event,
-                    user,
-                    reason,
-                    guild=self.state.guilds[gid])
-            except:
-                self.log.exception('Failed to force ban %s in %s', user, gid)
 
     @Plugin.command('about')
     def command_about(self, event):
         embed = MessageEmbed()
-        embed.set_author(name='Rowboat', icon_url=self.client.state.me.avatar_url, url='https://docs.rowboat.party/')
+        embed.set_author(name='Rowboat', icon_url=self.client.state.me.avatar_url, url='https://rowboat.party/')
         embed.description = BOT_INFO
         embed.add_field(name='Servers', value=str(Guild.select().count()), inline=True)
-        embed.add_field(name='Uptime', value=humanize.naturaltime(datetime.utcnow() - self.startup), inline=True)
+        embed.add_field(name='Uptime', value=humanize.naturaldelta(datetime.utcnow() - self.startup), inline=True)
         event.msg.reply('', embed=embed)
 
     @Plugin.command('uptime', level=-1)
     def command_uptime(self, event):
         event.msg.reply('Rowboat was started {}'.format(
-            humanize.naturaltime(datetime.utcnow() - self.startup)
+            humanize.naturaldelta(datetime.utcnow() - self.startup)
         ))
 
     @Plugin.command('source', '<command>', level=-1)
@@ -407,7 +536,7 @@ class CorePlugin(Plugin):
             if command.lower() in cmd.triggers:
                 break
         else:
-            event.msg.reply(u"Couldn't find command for `{}`".format(C(command)))
+            event.msg.reply(u"Couldn't find command for `{}`".format(S(command, escape_codeblocks=True)))
             return
 
         code = cmd.func.__code__
@@ -457,6 +586,61 @@ class CorePlugin(Plugin):
                 return
 
         if len(result) > 1990:
-            event.msg.reply('', attachment=('result.txt', result))
+            event.msg.reply('', attachments=[('result.txt', result)])
         else:
             event.msg.reply(PY_CODE_BLOCK.format(result))
+
+    @Plugin.command('sync-bans', group='control', level=-1)
+    def control_sync_bans(self, event):
+        guilds = list(Guild.select().where(
+            Guild.enabled == 1
+        ))
+
+        msg = event.msg.reply(':timer: pls wait while I sync...')
+
+        for guild in guilds:
+            guild.sync_bans(self.client.state.guilds.get(guild.guild_id))
+
+        msg.edit('<:{}> synced {} guilds'.format(GREEN_TICK_EMOJI, len(guilds)))
+
+    @Plugin.command('reconnect', group='control', level=-1)
+    def control_reconnect(self, event):
+        event.msg.reply('Ok, closing connection')
+        self.client.gw.ws.close()
+
+    @Plugin.command('invite', '<guild:snowflake>', group='guilds', level=-1)
+    def guild_join(self, event, guild):
+        guild = self.state.guilds.get(guild)
+        if not guild:
+            return event.msg.reply(':no_entry_sign: invalid or unknown guild ID')
+
+        msg = event.msg.reply(u'Ok, hold on while I get you setup with an invite link to {}'.format(
+            guild.name,
+        ))
+
+        general_channel = guild.channels[guild.id]
+
+        try:
+            invite = general_channel.create_invite(
+                max_age=300,
+                max_uses=1,
+                unique=True,
+            )
+        except:
+            return msg.edit(u':no_entry_sign: Hmmm, something went wrong creating an invite for {}'.format(
+                guild.name,
+            ))
+
+        msg.edit(u'Ok, here is a temporary invite for you: {}'.format(
+            invite.code,
+        ))
+
+    @Plugin.command('wh', '<guild:snowflake>', group='guilds', level=-1)
+    def guild_whitelist(self, event, guild):
+        rdb.sadd(GUILDS_WAITING_SETUP_KEY, str(guild))
+        event.msg.reply('Ok, guild %s is now in the whitelist' % guild)
+
+    @Plugin.command('unwh', '<guild:snowflake>', group='guilds', level=-1)
+    def guild_unwhitelist(self, event, guild):
+        rdb.srem(GUILDS_WAITING_SETUP_KEY, str(guild))
+        event.msg.reply('Ok, I\'ve made sure guild %s is no longer in the whitelist' % guild)

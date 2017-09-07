@@ -2,6 +2,7 @@ import re
 import six
 import json
 import uuid
+import traceback
 
 from peewee import (
     BigIntegerField, ForeignKeyField, TextField, DateTimeField,
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta
 from playhouse.postgres_ext import BinaryJSONField, ArrayField
 from disco.types.base import UNSET
 
+from rowboat import REV
 from rowboat.util import default_json
 from rowboat.models.user import User
 from rowboat.sql import BaseModel
@@ -29,6 +31,7 @@ class Message(BaseModel):
     edited_timestamp = DateTimeField(null=True, default=None)
     deleted = BooleanField(default=False)
     num_edits = BigIntegerField(default=0)
+    command = TextField(null=True)
 
     mentions = ArrayField(BigIntegerField, default=[], null=True)
     emojis = ArrayField(BigIntegerField, default=[], null=True)
@@ -39,10 +42,6 @@ class Message(BaseModel):
         CREATE INDEX\
                 IF NOT EXISTS messages_content_fts ON messages USING gin(to_tsvector('english', content));
         CREATE INDEX\
-                IF NOT EXISTS messages_content_trgm ON messages USING gin(content gin_trgm_ops);
-        CREATE INDEX\
-                IF NOT EXISTS messages_mentions ON messages USING gin (mentions);
-        CREATE INDEX\
                 IF NOT EXISTS messages_mentions ON messages USING gin (mentions);
     '''
 
@@ -50,9 +49,16 @@ class Message(BaseModel):
         db_table = 'messages'
 
         indexes = (
-            (('channel_id', 'id'), True),
-            (('guild_id', 'id'), True),
-            (('author_id', 'id'), True),
+            # These indexes are mostly just general use
+            (('channel_id', ), False),
+            (('guild_id', ), False),
+            (('deleted', ), False),
+
+            # Timestamp is regularly sorted on
+            (('timestamp', ), False),
+
+            # Some queries want to get history in a guild or channel
+            (('author', 'guild_id', 'channel_id'), False),
         )
 
     @classmethod
@@ -101,8 +107,17 @@ class Message(BaseModel):
         return created
 
     @classmethod
-    def from_disco_message_many(cls, objs):
-        cls.insert_many([{
+    def from_disco_message_many(cls, messages, safe=False):
+        q = cls.insert_many(map(cls.convert_message, messages))
+
+        if safe:
+            q = q.on_conflict('DO NOTHING')
+
+        return q.execute()
+
+    @staticmethod
+    def convert_message(obj):
+        return {
             'id': obj.id,
             'channel_id': obj.channel_id,
             'guild_id': (obj.guild and obj.guild.id),
@@ -115,7 +130,7 @@ class Message(BaseModel):
             'emojis': list(map(int, EMOJI_RE.findall(obj.content))),
             'attachments': [i.url for i in obj.attachments.values()],
             'embeds': [json.dumps(i.to_dict(), default=default_json) for i in obj.embeds],
-        } for obj in objs]).execute()
+        }
 
     @classmethod
     def for_channel(cls, channel):
@@ -131,6 +146,23 @@ class Reaction(BaseModel):
 
     class Meta:
         db_table = 'reactions'
+
+        indexes = (
+            (('message_id', 'user_id', 'emoji_id', 'emoji_name'), True),
+            (('user_id', ), False),
+            (('emoji_name', 'emoji_id', ), False),
+        )
+
+    @classmethod
+    def from_disco_reactors(cls, message_id, reaction, user_ids):
+        cls.insert_many([
+            {
+                'message_id': message_id,
+                'user_id': i,
+                'emoji_id': reaction.emoji.id or None,
+                'emoji_name': reaction.emoji.name or None
+            } for i in user_ids
+        ]).on_conflict('DO NOTHING').execute()
 
     @classmethod
     def from_disco_reaction(cls, obj):
@@ -166,7 +198,8 @@ class MessageArchive(BaseModel):
 
     @property
     def url(self):
-        return 'https://rowboat.party/archive/{}.txt'.format(self.archive_id)
+        # TODO: use web endpoint here
+        return 'https://dashboard.rowboat.party/archive/{}.txt'.format(self.archive_id)
 
     def encode(self, fmt='txt'):
         from rowboat.models.user import User
@@ -176,6 +209,7 @@ class MessageArchive(BaseModel):
 
         q = Message.select(
             Message.id,
+            Message.channel_id,
             Message.timestamp,
             Message.content,
             Message.deleted,
@@ -190,8 +224,9 @@ class MessageArchive(BaseModel):
         if fmt == 'txt':
             return u'\n'.join(map(self.encode_message_text, q))
         elif fmt == 'csv':
-            return u'\n'.join(
-                ['id,timestamp,author_id,author,content,deleted,attachments'] + map(self.encode_message_csv, q))
+            return u'\n'.join([
+                'id,channel_id,timestamp,author_id,author,content,deleted,attachments'
+            ] + map(self.encode_message_csv, q))
         elif fmt == 'json':
             return json.dumps({
                 'messages': map(self.encode_message_json, q)
@@ -199,7 +234,7 @@ class MessageArchive(BaseModel):
 
     @staticmethod
     def encode_message_text(msg):
-        return u'{m.timestamp} ({m.id} / {m.author.id}) {m.author}: {m.content} ({attach})'.format(
+        return u'{m.timestamp} ({m.id} / {m.channel_id} / {m.author.id}) {m.author}: {m.content} ({attach})'.format(
             m=msg, attach=', '.join(map(unicode, msg.attachments or [])))
 
     @staticmethod
@@ -324,3 +359,67 @@ class StarboardEntry(BaseModel):
                 )
             )) & (StarboardEntry.blocked == 1)
         ).execute()
+
+
+@BaseModel.register
+class Reminder(BaseModel):
+    message_id = BigIntegerField(primary_key=True)
+
+    created_at = DateTimeField(default=datetime.utcnow)
+    remind_at = DateTimeField()
+    content = TextField()
+
+    class Meta:
+        db_table = 'reminders'
+
+    @classmethod
+    def with_message_join(cls, fields=None):
+        return cls.select(
+            *(fields or (Reminder, Message))
+        ).join(Message, on=(
+            Reminder.message_id == Message.id
+        ))
+
+    @classmethod
+    def count_for_user(cls, user_id):
+        return cls.with_message_join().where(
+            (Message.author_id == user_id)
+        ).count()
+
+    @classmethod
+    def delete_for_user(cls, user_id):
+        return cls.delete().where(
+            (cls.message_id << cls.with_message_join((Message.id, )).where(
+                Message.author_id == user_id
+            ))
+        ).execute()
+
+
+@BaseModel.register
+class Command(BaseModel):
+    message_id = BigIntegerField(primary_key=True)
+
+    plugin = TextField()
+    command = TextField()
+    version = TextField()
+    success = BooleanField()
+    traceback = TextField(null=True)
+
+    class Meta:
+        db_table = 'commands'
+
+        indexes = (
+            (('success', ), False),
+            (('plugin', 'command'), False),
+        )
+
+    @classmethod
+    def track(cls, event, command, exception=False):
+        cls.create(
+            message_id=event.message.id,
+            plugin=command.plugin.name,
+            command=command.name,
+            version=REV,
+            success=not exception,
+            traceback=traceback.format_exc() if exception else None,
+        )

@@ -1,6 +1,11 @@
+import re
+import csv
 import time
+import gevent
 import humanize
+import operator
 
+from StringIO import StringIO
 from peewee import fn
 from holster.emitter import Priority
 from fuzzywuzzy import fuzz
@@ -8,24 +13,32 @@ from fuzzywuzzy import fuzz
 from datetime import datetime, timedelta
 
 from disco.bot import CommandLevels
-from disco.types.channel import Channel
+from disco.types.user import User as DiscoUser
 from disco.types.message import MessageTable, MessageEmbed, MessageEmbedField, MessageEmbedThumbnail
+from disco.types.permissions import Permissions
+from disco.util.functional import chunks
+from disco.util.sanitize import S
 
-from rowboat.plugins import RowboatPlugin as Plugin
-from rowboat.util import C
+from rowboat.plugins import RowboatPlugin as Plugin, CommandFail, CommandSuccess
 from rowboat.util.timing import Eventual
 from rowboat.util.images import get_dominant_colors_user
+from rowboat.util.input import parse_duration
+from rowboat.util.gevent import wait_many
 from rowboat.redis import rdb
-from rowboat.types import Field, ListField, snowflake, SlottedModel
+from rowboat.types import Field, DictField, ListField, snowflake, SlottedModel
 from rowboat.types.plugin import PluginConfig
 from rowboat.plugins.modlog import Actions
 from rowboat.models.user import User, Infraction
-from rowboat.models.guild import GuildMemberBackup, GuildBan, GuildEmoji
-from rowboat.models.message import Message, MessageArchive
+from rowboat.models.guild import GuildMemberBackup, GuildBan, GuildEmoji, GuildVoiceSession
+from rowboat.models.message import Message, Reaction, MessageArchive
+from rowboat.constants import (
+    GREEN_TICK_EMOJI_ID, RED_TICK_EMOJI_ID, GREEN_TICK_EMOJI, RED_TICK_EMOJI
+)
 
+EMOJI_RE = re.compile(r'<:[a-zA-Z0-9_]+:([0-9]+)>')
 
 CUSTOM_EMOJI_STATS_SERVER_SQL = """
-SELECT gm.emoji_id, gm.name, count(*) FROM guildemojis gm
+SELECT gm.emoji_id, gm.name, count(*) FROM guild_emojis gm
 JOIN messages m ON m.emojis @> ARRAY[gm.emoji_id]
 WHERE gm.deleted=false AND gm.guild_id={guild} AND m.guild_id={guild}
 GROUP BY 1, 2
@@ -34,13 +47,19 @@ LIMIT 30
 """
 
 CUSTOM_EMOJI_STATS_GLOBAL_SQL = """
-SELECT gm.emoji_id, gm.name, count(*) FROM guildemojis gm
+SELECT gm.emoji_id, gm.name, count(*) FROM guild_emojis gm
 JOIN messages m ON m.emojis @> ARRAY[gm.emoji_id]
 WHERE gm.deleted=false AND gm.guild_id={guild}
 GROUP BY 1, 2
 ORDER BY 3 {}
 LIMIT 30
 """
+
+
+def clamp(string, size):
+    if len(string) > size:
+        return string[:size] + '...'
+    return string
 
 
 def maybe_string(obj, exists, notexists, **kwargs):
@@ -63,9 +82,18 @@ class AdminConfig(PluginConfig):
     # Role saving information
     persist = Field(PersistConfig, default=None)
 
+    # Aliases to roles, can be used in place of IDs in commands
+    role_aliases = DictField(unicode, snowflake)
+
+    # Group roles can be joined/left by any user
+    group_roles = DictField(lambda value: unicode(value).lower(), snowflake)
+
+    # Locked roles cannot be changed unless they are unlocked w/ command
+    locked_roles = ListField(snowflake)
+
     # The mute role
     mute_role = Field(snowflake, default=None)
-    temp_mute_role = Field(snowflake, default=None)
+    reason_edit_level = Field(int, default=int(CommandLevels.ADMIN))
 
 
 @Plugin.with_config(AdminConfig)
@@ -73,22 +101,24 @@ class AdminPlugin(Plugin):
     def load(self, ctx):
         super(AdminPlugin, self).load(ctx)
 
+        self.cleans = {}
         self.inf_task = Eventual(self.clear_infractions)
-        self.spawn(self.queue_infractions)
+        self.spawn_later(5, self.queue_infractions)
+
+        self.unlocked_roles = {}
+        self.role_debounces = {}
 
     def queue_infractions(self):
-        time.sleep(5)
-
         next_infraction = list(Infraction.select().where(
             (Infraction.active == 1) &
             (~(Infraction.expires_at >> None))
         ).order_by(Infraction.expires_at.asc()).limit(1))
 
         if not next_infraction:
-            self.log.info('No infractions to wait for')
+            self.log.info('[INF] no infractions to wait for')
             return
 
-        self.log.info('Waiting until %s', next_infraction[0].expires_at)
+        self.log.info('[INF] waiting until %s for %s', next_infraction[0].expires_at, next_infraction[0].id)
         self.inf_task.set_next_schedule(next_infraction[0].expires_at)
 
     def clear_infractions(self):
@@ -97,33 +127,72 @@ class AdminPlugin(Plugin):
             (Infraction.expires_at < datetime.utcnow())
         ))
 
+        self.log.info('[INF] attempting to clear %s expired infractions', len(expired))
+
         for item in expired:
             guild = self.state.guilds.get(item.guild_id)
             if not guild:
+                self.log.warning('[INF] failed to clear infraction %s, no guild exists', item.id)
                 continue
 
             # TODO: hacky
             type_ = {i.index: i for i in Infraction.Types.attrs}[item.type_]
             if type_ == Infraction.Types.TEMPBAN:
-                # TODO: debounce
+                self.call(
+                    'ModLogPlugin.create_debounce',
+                    guild.id,
+                    ['GuildBanRemove'],
+                    user_id=item.user_id,
+                )
+
                 guild.delete_ban(item.user_id)
-            elif type_ == Infraction.Types.TEMPMUTE:
-                # TODO: remove in backups
+
+                # TODO: perhaps join on users above and use username from db
+                self.call(
+                    'ModLogPlugin.log_action_ext',
+                    Actions.MEMBER_TEMPBAN_EXPIRE,
+                    guild.id,
+                    user_id=item.user_id,
+                    user=unicode(self.state.users.get(item.user_id) or item.user_id),
+                    inf=item
+                )
+            elif type_ == Infraction.Types.TEMPMUTE or Infraction.Types.TEMPROLE:
                 member = guild.get_member(item.user_id)
-                if member and item.metadata['role'] in member.roles:
-                    member.remove_role(item.metadata['role'])
+                if member:
+                    if item.metadata['role'] in member.roles:
+                        self.call(
+                            'ModLogPlugin.create_debounce',
+                            guild.id,
+                            ['GuildMemberUpdate'],
+                            user_id=item.user_id,
+                            role_id=item.metadata['role'],
+                        )
+
+                        member.remove_role(item.metadata['role'])
+
+                        self.call(
+                            'ModLogPlugin.log_action_ext',
+                            Actions.MEMBER_TEMPMUTE_EXPIRE,
+                            guild.id,
+                            member=member,
+                            inf=item
+                        )
+                else:
+                    GuildMemberBackup.remove_role(
+                        item.guild_id,
+                        item.user_id,
+                        item.metadata['role'])
+            else:
+                self.log.warning('[INF] failed to clear infraction %s, type is invalid %s', item.id, item.type_)
+                continue
 
             # TODO: n+1
             item.active = False
             item.save()
 
+        # Wait a few seconds to backoff from a possible bad loop, and requeue new infractions
+        gevent.sleep(5)
         self.queue_infractions()
-
-    @Plugin.listen('GuildMemberRemove', priority=Priority.BEFORE)
-    def on_guild_member_remove(self, event):
-        self.log.info('Creating backup for user %s', event.user)
-        if event.user.id in event.guild.members:
-            GuildMemberBackup.create_from_member(event.guild.members.get(event.user.id))
 
     def restore_user(self, event, member):
         try:
@@ -139,7 +208,9 @@ class AdminPlugin(Plugin):
             if event.config.persist.role_ids:
                 roles &= set(event.config.persist.role_ids)
 
-            kwargs['roles'] = list(set(backup.roles) & roles)
+            roles = set(backup.roles) & roles
+            if roles:
+                kwargs['roles'] = list(roles)
 
         if event.config.persist.nickname and backup.nick is not None:
             kwargs['nick'] = backup.nick
@@ -151,9 +222,25 @@ class AdminPlugin(Plugin):
         if not kwargs:
             return
 
-        self.bot.plugins.get('ModLogPlugin').create_debounce(event, member.user, 'restore')
+        self.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberUpdate'],
+        )
+
         member.modify(**kwargs)
-        self.bot.plugins.get('ModLogPlugin').log_action_ext(Actions.MEMBER_RESTORE, event)
+
+        self.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_RESTORE,
+            event.guild.id,
+            member=member,
+        )
+
+    @Plugin.listen('GuildMemberRemove', priority=Priority.BEFORE)
+    def on_guild_member_remove(self, event):
+        if event.user.id in event.guild.members:
+            GuildMemberBackup.create_from_member(event.guild.members.get(event.user.id))
 
     @Plugin.listen('GuildMemberAdd')
     def on_guild_member_add(self, event):
@@ -162,14 +249,60 @@ class AdminPlugin(Plugin):
 
         self.restore_user(event, event.member)
 
+    @Plugin.listen('GuildMemberUpdate', priority=Priority.BEFORE)
+    def on_guild_member_update(self, event):
+        pre_member = event.guild.members.get(event.id)
+        if not pre_member:
+            return
+
+        pre_roles = set(pre_member.roles)
+        post_roles = set(event.roles)
+        if pre_roles == post_roles:
+            return
+
+        removed = pre_roles - post_roles
+
+        # If the user was unmuted, mark any temp-mutes as inactive
+        if event.config.mute_role in removed:
+            Infraction.clear_active(event, event.user.id, [Infraction.Types.TEMPMUTE])
+
+    @Plugin.listen('GuildBanRemove')
+    def on_guild_ban_remove(self, event):
+        Infraction.clear_active(event, event.user.id, [Infraction.Types.BAN, Infraction.Types.TEMPBAN])
+
+    @Plugin.listen('GuildRoleUpdate', priority=Priority.BEFORE)
+    def on_guild_role_update(self, event):
+        if event.role.id not in event.config.locked_roles:
+            return
+
+        if event.role.id in self.unlocked_roles and self.unlocked_roles[event.role.id] > time.time():
+            return
+
+        if event.role.id in self.role_debounces:
+            if self.role_debounces.pop(event.role.id) > time.time():
+                return
+
+        role_before = event.guild.roles.get(event.role.id)
+        if not role_before:
+            return
+
+        to_update = {}
+        for field in ('name', 'hoist', 'color', 'permissions', 'position'):
+            if getattr(role_before, field) != getattr(event.role, field):
+                to_update[field] = getattr(role_before, field)
+
+        if to_update:
+            self.log.warning('Rolling back update to roll %s (in %s), roll is locked', event.role.id, event.guild_id)
+            self.role_debounces[event.role.id] = time.time() + 60
+            event.role.update(**to_update)
+
     @Plugin.command('unban', '<user:snowflake> [reason:str...]', level=CommandLevels.MOD)
     def unban(self, event, user, reason=None):
         try:
             GuildBan.get(user_id=user, guild_id=event.guild.id)
             event.guild.delete_ban(user)
         except GuildBan.DoesNotExist:
-            event.msg.reply('UID {} is not banned'.format(user))
-            return
+            raise CommandFail('user with id `{}` is not banned'.format(user))
 
         Infraction.create(
             guild_id=event.guild.id,
@@ -178,9 +311,40 @@ class AdminPlugin(Plugin):
             type_=Infraction.Types.UNBAN,
             reason=reason
         )
-        event.msg.reply(':ok_hand: unbanned')
+        raise CommandSuccess('unbanned user with id `{}`'.format(user))
 
-    @Plugin.command('infraction info', '<infraction:int>', level=CommandLevels.MOD)
+    @Plugin.command('archive', group='infractions', level=CommandLevels.ADMIN)
+    def infractions_archive(self, event):
+        user = User.alias()
+        actor = User.alias()
+
+        q = Infraction.select(Infraction, user, actor).join(
+            user,
+            on=((Infraction.user_id == user.user_id).alias('user'))
+        ).switch(Infraction).join(
+            actor,
+            on=((Infraction.actor_id == actor.user_id).alias('actor'))
+        ).where(Infraction.guild_id == event.guild.id)
+
+        buff = StringIO()
+        w = csv.writer(buff)
+
+        for inf in q:
+            w.writerow([
+                inf.id,
+                inf.user_id,
+                unicode(inf.user).encode('utf-8'),
+                inf.actor_id,
+                unicode(inf.actor).encode('utf-8'),
+                unicode({i.index: i for i in Infraction.Types.attrs}[inf.type_]).encode('utf-8'),
+                unicode(inf.reason).encode('utf-8'),
+            ])
+
+        event.msg.reply('Ok, here is an archive of all infractions', attachments=[
+            ('infractions.csv', buff.getvalue())
+        ])
+
+    @Plugin.command('info', '<infraction:int>', group='infractions', level=CommandLevels.MOD)
     def infraction_info(self, event, infraction):
         try:
             user = User.alias()
@@ -192,15 +356,17 @@ class AdminPlugin(Plugin):
             ).switch(Infraction).join(
                 actor,
                 on=((Infraction.actor_id == actor.user_id).alias('actor'))
-            ).where(Infraction.id == infraction).get()
+            ).where(
+                    (Infraction.id == infraction) &
+                    (Infraction.guild_id == event.guild.id)
+            ).get()
         except Infraction.DoesNotExist:
-            event.msg.reply('Cannot find infraction with that ID')
-            return
+            raise CommandFail('cannot find an infraction with ID `{}`'.format(infraction))
 
         type_ = {i.index: i for i in Infraction.Types.attrs}[infraction.type_]
         embed = MessageEmbed()
 
-        if type_ in (Infraction.Types.MUTE, Infraction.Types.TEMPMUTE):
+        if type_ in (Infraction.Types.MUTE, Infraction.Types.TEMPMUTE, Infraction.Types.TEMPROLE):
             embed.color = 0xfdfd96
         elif type_ in (Infraction.Types.KICK, Infraction.Types.SOFTBAN):
             embed.color = 0xffb347
@@ -213,17 +379,21 @@ class AdminPlugin(Plugin):
         embed.add_field(name='Moderator', value=unicode(infraction.actor), inline=True)
         embed.add_field(name='Active', value='yes' if infraction.active else 'no', inline=True)
         if infraction.active and infraction.expires_at:
-            embed.add_field(name='Expires', value=humanize.naturaltime(infraction.expires_at))
+            embed.add_field(name='Expires', value=humanize.naturaldelta(infraction.expires_at - datetime.utcnow()))
         embed.add_field(name='Reason', value=infraction.reason or '_No Reason Given', inline=False)
         embed.timestamp = infraction.created_at.isoformat()
-
         event.msg.reply('', embed=embed)
 
-    @Plugin.command('infraction search', '[query:str...]', level=CommandLevels.MOD)
+    @Plugin.command('search', '[query:user|str...]', group='infractions', level=CommandLevels.MOD)
     def infraction_search(self, event, query=None):
         q = (Infraction.guild_id == event.guild.id)
 
-        if query and query.isdigit():
+        if query and isinstance(query, list) and isinstance(query[0], DiscoUser):
+            query = query[0].id
+        elif query:
+            query = ' '.join(query)
+
+        if query and (isinstance(query, int) or query.isdigit()):
             q &= (
                 (Infraction.id == int(query)) |
                 (Infraction.user_id == int(query)) |
@@ -240,11 +410,11 @@ class AdminPlugin(Plugin):
         ).switch(Infraction).join(
             actor,
             on=((Infraction.actor_id == actor.user_id).alias('actor'))
-        ).where(q).order_by(Infraction.created_at.desc()).limit(10)
+        ).where(q).order_by(Infraction.created_at.desc()).limit(6)
 
         tbl = MessageTable()
 
-        tbl.set_header('ID', 'Type', 'User', 'Moderator', 'Active', 'Reason')
+        tbl.set_header('ID', 'Created', 'Type', 'User', 'Moderator', 'Active', 'Reason')
         for inf in infractions:
             type_ = {i.index: i for i in Infraction.Types.attrs}[inf.type_]
             reason = inf.reason or ''
@@ -254,13 +424,68 @@ class AdminPlugin(Plugin):
             if inf.active:
                 active = 'yes'
                 if inf.expires_at:
-                    active += ' (expires in {})'.format(humanize.naturaltime(inf.expires_at))
+                    active += ' (expires in {})'.format(humanize.naturaldelta(inf.expires_at - datetime.utcnow()))
             else:
                 active = 'no'
 
-            tbl.add(inf.id, str(type_), unicode(inf.user), unicode(inf.actor), active, reason)
+            tbl.add(
+                inf.id,
+                inf.created_at.isoformat(),
+                str(type_),
+                unicode(inf.user),
+                unicode(inf.actor),
+                active,
+                clamp(reason, 128)
+            )
 
         event.msg.reply(tbl.compile())
+
+    @Plugin.command('recent', aliases=['latest'], group='infractions', level=CommandLevels.MOD)
+    def infractions_recent(self, event):
+        # TODO: fucking write this bruh
+        pass
+
+    @Plugin.command('duration', '<infraction:int> <duration:str>', group='infractions', level=CommandLevels.MOD)
+    def infraction_duration(self, event, infraction, duration):
+        try:
+            inf = Infraction.get(id=infraction)
+        except Infraction.DoesNotExist:
+            raise CommandFail('invalid infraction (try `!infractions recent`)')
+
+        if inf.actor_id != event.author.id and event.user_level < CommandLevels.ADMIN:
+            raise CommandFail('only administrators can modify the duration of infractions created by other moderators')
+
+        if not inf.active:
+            raise CommandFail('that infraction is not active and cannot be updated')
+
+        expires_dt = parse_duration(duration, inf.created_at)
+
+        converted = False
+        if inf.type_ in [Infraction.Types.MUTE.index, Infraction.Types.BAN.index]:
+            inf.type_ = (
+                Infraction.Types.TEMPMUTE
+                if inf.type_ == Infraction.Types.MUTE.index else
+                Infraction.Types.TEMPBAN
+            )
+            converted = True
+        elif inf.type_ not in [
+                Infraction.Types.TEMPMUTE.index,
+                Infraction.Types.TEMPBAN.index,
+                Infraction.Types.TEMPROLE.index]:
+            raise CommandFail('cannot set the duration for that type of infraction')
+
+        inf.expires_at = expires_dt
+        inf.save()
+        self.queue_infractions()
+
+        if converted:
+            raise CommandSuccess('ok, I\'ve made that infraction temporary, it will now expire on {}'.format(
+                inf.expires_at.isoformat()
+            ))
+        else:
+            raise CommandSuccess('ok, I\'ve updated that infractions duration, it will now expire on {}'.format(
+                inf.expires_at.isoformat()
+            ))
 
     @Plugin.command('reason', '<infraction:int> <reason:str...>', level=CommandLevels.MOD)
     def reason(self, event, infraction, reason):
@@ -276,137 +501,193 @@ class AdminPlugin(Plugin):
         if not inf.actor_id:
             inf.actor_id = event.author.id
 
-        if inf.actor_id != event.author.id:
-            event.msg.reply(':warning: you cannot alter other moderators infractions')
-            return
+        if inf.actor_id != event.author.id and event.user_level < event.config.reason_edit_level:
+            raise CommandFail('you do not have the permissions required to edit other moderators infractions')
 
         inf.reason = reason
         inf.save()
 
-        event.msg.reply(':ok_hand: updated the reason information for infraction #{}'.format(
-            inf.id,
-        ))
+        raise CommandSuccess('I\'ve updated the reason for infraction #{}'.format(inf.id))
 
     @Plugin.command('roles', level=CommandLevels.MOD)
     def roles(self, event):
-        """
-        Displays all available roles and their corresponding IDs
-        """
-        roles = []
+        buff = ''
         for role in event.guild.roles.values():
-            roles.append(C(u'{} - {}'.format(role.id, role.name)))
-        return event.msg.reply(u'```{}```'.format('\n'.join(roles)))
+            role = S(u'{} - {}\n'.format(role.id, role.name), escape_codeblocks=True)
+            if len(role) + len(buff) > 1990:
+                event.msg.reply(u'```{}```'.format(buff))
+                buff = ''
+            buff += role
+        return event.msg.reply(u'```{}```'.format(buff))
 
-    @Plugin.command('restore', '<user:user>', level=CommandLevels.MOD)
+    @Plugin.command('restore', '<user:user>', level=CommandLevels.MOD, group='backups')
     def restore(self, event, user):
-        """
-        Restores a users previous roles after rejoining
-        """
-        member = self.guild.get_member(user)
+        member = event.guild.get_member(user)
         if member:
             self.restore_user(event, member)
         else:
-            event.msg.reply(':warning: Invalid user!')
+            raise CommandFail('invalid user')
+
+    @Plugin.command('clear', '<user_id:snowflake>', level=CommandLevels.MOD, group='backups')
+    def backups_clear(self, event, user_id):
+        deleted = bool(GuildMemberBackup.delete().where(
+            (GuildMemberBackup.user_id == user_id) &
+            (GuildMemberBackup.guild_id == event.guild.id)
+        ).execute())
+
+        if deleted:
+            event.msg.reply(':ok_hand: I\'ve cleared the member backup for that user')
+        else:
+            raise CommandFail('I couldn\t find any member backups for that user')
+
+    def can_act_on(self, event, victim_id, throw=True):
+        if event.author.id == victim_id:
+            if not throw:
+                return False
+            raise CommandFail('cannot execute that action on yourself')
+
+        victim_level = self.bot.plugins.get('CorePlugin').get_level(event.guild, victim_id)
+
+        if event.user_level <= victim_level:
+            if not throw:
+                return False
+            raise CommandFail('invalid permissions')
+
+        return True
 
     @Plugin.command('mute', '<user:user|snowflake> [reason:str...]', level=CommandLevels.MOD)
-    def mute(self, event, user, reason=None):
-        """
-        Mutes a user (if setup on the server)
-        """
+    @Plugin.command('tempmute', '<user:user|snowflake> <duration:str> [reason:str...]', level=CommandLevels.MOD)
+    def tempmute(self, event, user, duration=None, reason=None):
+        if not duration and reason:
+            duration = parse_duration(reason.split(' ')[0], safe=True)
+            if duration:
+                if ' ' in reason:
+                    reason = reason.split(' ', 1)[-1]
+                else:
+                    reason = None
+        else:
+            duration = parse_duration(duration)
+
         member = event.guild.get_member(user)
         if member:
+            self.can_act_on(event, member.id)
             if not event.config.mute_role:
-                event.msg.reply(':warning: mute is not setup on this server')
-                return
+                raise CommandFail('mute is not setup on this server')
 
-            if len({event.config.temp_mute_role, event.config.mute_role} & set(member.roles)):
-                event.msg.reply(':warning: {} is already muted'.format(member.user))
-                return
+            if event.config.mute_role in member.roles:
+                raise CommandFail(u'{} is already muted'.format(member.user))
 
-            Infraction.mute(self, event, member, reason)
-            if event.config.confirm_actions:
-                event.msg.reply(maybe_string(
-                    reason,
-                    u':ok_hand: {u} is now muted (`{o}`)',
-                    u':ok_hand: {u} is now muted',
-                    u=member.user,
-                ))
+            # If we have a duration set, this is a tempmute
+            if duration:
+                # Create the infraction
+                Infraction.tempmute(self, event, member, reason, duration)
+                self.queue_infractions()
+
+                if event.config.confirm_actions:
+                    event.msg.reply(maybe_string(
+                        reason,
+                        u':ok_hand: {u} is now muted for {t} (`{o}`)',
+                        u':ok_hand: {u} is now muted for {t}',
+                        u=member.user,
+                        t=humanize.naturaldelta(duration - datetime.utcnow()),
+                    ))
+            else:
+                existed = False
+                # If the user is already muted check if we can take this from a temp
+                #  to perma mute.
+                if event.config.mute_role in member.roles:
+                    existed = Infraction.clear_active(event, member.id, [Infraction.Types.TEMPMUTE])
+
+                    # The user is 100% muted and not tempmuted at this point, so lets bail
+                    if not existed:
+                        raise CommandFail(u'{} is already muted'.format(member.user))
+
+                Infraction.mute(self, event, member, reason)
+
+                if event.config.confirm_actions:
+                    existed = u' [was temp-muted]' if existed else ''
+                    event.msg.reply(maybe_string(
+                        reason,
+                        u':ok_hand: {u} is now muted (`{o}`)' + existed,
+                        u':ok_hand: {u} is now muted' + existed,
+                        u=member.user,
+                    ))
         else:
-            event.msg.reply(':warning: Invalid user!')
+            raise CommandFail('invalid user')
 
-    @Plugin.command('tempmute', '<user:user|snowflake> <duration:duration> [reason:str...]', level=CommandLevels.MOD)
-    def tempmute(self, event, user, duration, reason=None):
-        """
-        Temporarily mutes a user (if setup on the server)
-        """
+    @Plugin.command(
+        'temprole',
+        '<user:user|snowflake> <role:snowflake|str> <duration:str> [reason:str...]',
+        level=CommandLevels.MOD)
+    def temprole(self, event, user, role, duration, reason=None):
         member = event.guild.get_member(user)
-        if member:
-            if not event.config.temp_mute_role and not event.config.mute_role:
-                event.msg.reply(':warning: mute is not setup on this server')
-                return
+        if not member:
+            raise CommandFail('invalid user')
 
-            if len({event.config.temp_mute_role, event.config.mute_role} & set(member.roles)):
-                event.msg.reply(':warning: {} is already muted'.format(member.user))
-                return
+        self.can_act_on(event, member.id)
+        role_id = role if isinstance(role, (int, long)) else event.config.role_aliases.get(role.lower())
+        if not role_id or role_id not in event.guild.roles:
+            raise CommandFail('invalid or unknown role')
 
-            duration = datetime.utcnow() + (datetime.utcnow() - duration)
-            self.inf_task.set_next_schedule(duration)
-            Infraction.tempmute(self, event, member, reason, duration)
-            if event.config.confirm_actions:
-                event.msg.reply(maybe_string(
-                    reason,
-                    u':ok_hand: {u} is now muted until {t} (`{o}`)',
-                    u':ok_hand: {u} is now muted until {t}',
-                    u=member.user,
-                    t=humanize.naturaltime(duration),
-                ))
-        else:
-            event.msg.reply(':warning: Invalid user!')
+        if role_id in member.roles:
+            raise CommandFail(u'{} is already in that role'.format(member.user))
+
+        expire_dt = parse_duration(duration)
+        Infraction.temprole(self, event, member, role_id, reason, expire_dt)
+        self.queue_infractions()
+
+        if event.config.confirm_actions:
+            event.msg.reply(maybe_string(
+                reason,
+                u':ok_hand: {u} is now in the {r} role for {t} (`{o}`)',
+                u':ok_hand: {u} is now in the {r} role for {t}',
+                r=event.guild.roles[role_id].name,
+                u=member.user,
+                t=humanize.naturaldelta(expire_dt - datetime.utcnow()),
+            ))
 
     @Plugin.command('unmute', '<user:user|snowflake>', level=CommandLevels.MOD)
     def unmute(self, event, user, reason=None):
-        """
-        Unmutes a user (if they are muted)
-        """
         # TOOD: eventually we should pull the role from the GuildMemberBackup if they arent in server
         member = event.guild.get_member(user)
 
         if member:
-            if not event.config.temp_mute_role and not event.config.mute_role:
-                event.msg.reply(':warning: mute is not setup on this server')
-                return
+            self.can_act_on(event, member.id)
+            if not event.config.mute_role:
+                raise CommandFail('mute is not setup on this server')
 
-            roles = {event.config.temp_mute_role, event.config.mute_role} & set(member.roles)
-            if not len(roles):
-                event.msg.reply(':warning: {} is not muted'.format(member.user))
-                return
+            if event.config.mute_role not in member.roles:
+                raise CommandFail(u'{} is not muted'.format(member.user))
 
-            Infraction.update(
-                active=False
-            ).where(
-                (Infraction.guild_id == event.guild.id) &
-                (Infraction.user_id == member.user.id) &
-                (Infraction.type_ == Infraction.Types.TEMPMUTE) &
-                (Infraction.active == 1)
-            ).execute()
+            Infraction.clear_active(event, member.id, [Infraction.Types.MUTE, Infraction.Types.TEMPMUTE])
 
-            self.bot.plugins.get('ModLogPlugin').create_debounce(event, member.user, 'unmuted', actor=unicode(event.author), roles=roles)
+            self.call(
+                'ModLogPlugin.create_debounce',
+                event,
+                ['GuildMemberUpdate'],
+                role_id=event.config.mute_role,
+            )
 
-            for role in roles:
-                member.remove_role(role)
+            member.remove_role(event.config.mute_role)
+
+            self.call(
+                'ModLogPlugin.log_action_ext',
+                Actions.MEMBER_UNMUTED,
+                event.guild.id,
+                member=member,
+                actor=unicode(event.author) if event.author.id != member.id else 'Automatic',
+            )
 
             if event.config.confirm_actions:
                 event.msg.reply(u':ok_hand: {} is now unmuted'.format(member.user))
         else:
-            event.msg.reply(':warning: Invalid user!')
+            raise CommandFail('invalid user')
 
     @Plugin.command('kick', '<user:user|snowflake> [reason:str...]', level=CommandLevels.MOD)
     def kick(self, event, user, reason=None):
-        """
-        Kick a user from the server (with an optional reason for the modlog)
-        """
         member = event.guild.get_member(user)
         if member:
+            self.can_act_on(event, member.id)
             Infraction.kick(self, event, member, reason)
             if event.config.confirm_actions:
                 event.msg.reply(maybe_string(
@@ -416,25 +697,65 @@ class AdminPlugin(Plugin):
                     u=member.user,
                 ))
         else:
-            event.msg.reply(':warning: Invalid user!')
+            raise CommandFail('invalid user')
+
+    @Plugin.command('mkick', parser=True, level=CommandLevels.MOD)
+    @Plugin.parser.add_argument('users', type=long, nargs='+')
+    @Plugin.parser.add_argument('-r', '--reason', default='', help='reason for modlog')
+    def mkick(self, event, args):
+        members = []
+        for user_id in args.users:
+            member = event.guild.get_member(user_id)
+            if not member:
+                # TODO: this sucks, batch these
+                raise CommandFail('failed to kick {}, user not found'.format(user_id))
+
+            if not self.can_act_on(event, member.id, throw=False):
+                raise CommandFail('failed to kick {}, invalid permissions'.format(user_id))
+
+            members.append(member)
+
+        msg = event.msg.reply('Ok, kick {} users for `{}`?'.format(len(members), args.reason or 'no reason'))
+        msg.chain(False).\
+            add_reaction(GREEN_TICK_EMOJI).\
+            add_reaction(RED_TICK_EMOJI)
+
+        try:
+            mra_event = self.wait_for_event(
+                'MessageReactionAdd',
+                message_id=msg.id,
+                conditional=lambda e: (
+                    e.emoji.id in (GREEN_TICK_EMOJI_ID, RED_TICK_EMOJI_ID) and
+                    e.user_id == event.author.id
+                )).get(timeout=10)
+        except gevent.Timeout:
+            return
+        finally:
+            msg.delete()
+
+        if mra_event.emoji.id != GREEN_TICK_EMOJI_ID:
+            return
+
+        for member in members:
+            Infraction.kick(self, event, member, args.reason)
+
+        raise CommandSuccess('kicked {} users'.format(len(members)))
 
     @Plugin.command('ban', '<user:user|snowflake> [reason:str...]', level=CommandLevels.MOD)
     @Plugin.command('forceban', '<user:snowflake> [reason:str...]', level=CommandLevels.MOD)
     def ban(self, event, user, reason=None):
-        """
-        Ban a user from the server (with an optional reason for the modlog)
-        """
         member = None
 
         if isinstance(user, (int, long)):
+            self.can_act_on(event, user)
             Infraction.ban(self, event, user, reason, guild=event.guild)
         else:
             member = event.guild.get_member(user)
             if member:
+                self.can_act_on(event, member.id)
                 Infraction.ban(self, event, member, reason, guild=event.guild)
             else:
-                event.msg.reply(':warning: Invalid user!')
-                return
+                raise CommandFail('invalid user')
 
         if event.config.confirm_actions:
             event.msg.reply(maybe_string(
@@ -451,6 +772,7 @@ class AdminPlugin(Plugin):
         """
         member = event.guild.get_member(user)
         if member:
+            self.can_act_on(event, member.id)
             Infraction.softban(self, event, member, reason)
             if event.config.confirm_actions:
                 event.msg.reply(maybe_string(
@@ -460,39 +782,61 @@ class AdminPlugin(Plugin):
                     u=member.user,
                 ))
         else:
-            event.msg.reply(':warning: Invalid user!')
+            raise CommandFail('invald user')
 
-    @Plugin.command('tempban', '<user:user|snowflake> <duration:duration> [reason:str...]', level=CommandLevels.MOD)
+    @Plugin.command('tempban', '<user:user|snowflake> <duration:str> [reason:str...]', level=CommandLevels.MOD)
     def tempban(self, event, duration, user, reason=None):
-        """
-        Ban a user from the server for a given duration (with an optional reason for the modlog)
-        """
         member = event.guild.get_member(user)
         if member:
-            duration = datetime.utcnow() + (datetime.utcnow() - duration)
-            self.inf_task.set_next_schedule(duration)
-            Infraction.tempban(self, event, member, reason, duration)
+            self.can_act_on(event, member.id)
+            expires_dt = parse_duration(duration)
+            Infraction.tempban(self, event, member, reason, expires_dt)
+            self.queue_infractions()
             if event.config.confirm_actions:
                 event.msg.reply(maybe_string(
                     reason,
-                    u':ok_hand: temp-banned {u} until {t} (`{o}`)',
-                    u':ok_hand: soft-banned {u} until {t}',
+                    u':ok_hand: temp-banned {u} for {t} (`{o}`)',
+                    u':ok_hand: temp-banned {u} for {t}',
                     u=member.user,
-                    t=humanize.naturaltime(duration),
+                    t=humanize.naturaldelta(expires_dt - datetime.utcnow()),
                 ))
         else:
-            event.msg.reply(':warning: Invalid user!')
+            raise CommandFail('invalid user')
+
+    @Plugin.command('warn', '<user:user|snowflake> [reason:str...]', level=CommandLevels.MOD)
+    def warn(self, event, user, reason=None):
+        member = None
+
+        member = event.guild.get_member(user)
+        if member:
+            self.can_act_on(event, member.id)
+            Infraction.warn(self, event, member, reason, guild=event.guild)
+        else:
+            raise CommandFail('invalid user')
+
+        if event.config.confirm_actions:
+            event.msg.reply(maybe_string(
+                reason,
+                u':ok_hand: warned {u} (`{o}`)',
+                u':ok_hand: warned {u}',
+                u=member.user if member else user,
+            ))
 
     @Plugin.command('archive here', '[size:int]', level=CommandLevels.MOD, context={'mode': 'all'})
     @Plugin.command('archive all', '[size:int]', level=CommandLevels.MOD, context={'mode': 'all'})
-    @Plugin.command('archive user', '<user:user|snowflake> [size:int]', level=CommandLevels.MOD, context={'mode': 'user'})
-    @Plugin.command('archive channel', '<channel:channel|snowflake> [size:int]', level=CommandLevels.MOD, context={'mode': 'channel'})
+    @Plugin.command(
+        'archive user',
+        '<user:user|snowflake> [size:int]',
+        level=CommandLevels.MOD,
+        context={'mode': 'user'})
+    @Plugin.command(
+        'archive channel',
+        '<channel:channel|snowflake> [size:int]',
+        level=CommandLevels.MOD,
+        context={'mode': 'channel'})
     def archive(self, event, size=50, mode=None, user=None, channel=None):
-        """
-        Creates and links an archive of messages
-        """
         if 0 > size >= 15000:
-            return event.msg.reply(':warning: Too many messages, must be between 1-15000')
+            raise CommandFail('too many messages must be between 1-15000')
 
         q = Message.select(Message.id).join(User).order_by(Message.id.desc()).limit(size)
 
@@ -507,6 +851,14 @@ class AdminPlugin(Plugin):
         archive = MessageArchive.create_from_message_ids([i.id for i in q])
         event.msg.reply('OK, archived {} messages at {}'.format(len(archive.message_ids), archive.url))
 
+    @Plugin.command('clean cancel', level=CommandLevels.MOD)
+    def clean_cacnel(self, event):
+        if event.channel.id not in self.cleans:
+            raise CommandFail('no clean is running in this channel')
+
+        self.cleans[event.channel.id].kill()
+        event.msg.reply('Ok, the running clean was cancelled')
+
     @Plugin.command('clean all', '[size:int]', level=CommandLevels.MOD, context={'mode': 'all'})
     @Plugin.command('clean bots', '[size:int]', level=CommandLevels.MOD, context={'mode': 'bots'})
     @Plugin.command('clean user', '<user:user> [size:int]', level=CommandLevels.MOD, context={'mode': 'user'})
@@ -515,38 +867,83 @@ class AdminPlugin(Plugin):
         Removes messages
         """
         if 0 > size >= 10000:
-            return event.msg.reply(':warning: Too many messages, must be between 1-10000')
+            raise CommandFail('too many messages must be between 1-10000')
 
-        lock = rdb.lock('clean-{}'.format(event.channel.id))
-        if not lock.acquire(blocking=False):
-            return event.msg.reply(':warning: already running a clean on this channel')
+        if event.channel.id in self.cleans:
+            raise CommandFail('a clean is already running on this channel')
 
-        try:
-            query = Message.select().where(
-                (Message.deleted >> False) &
-                (Message.channel_id == event.channel.id) &
-                (Message.timestamp > (datetime.utcnow() - timedelta(days=13)))
-            ).join(User).order_by(Message.timestamp.desc()).limit(size)
+        query = Message.select(Message.id).where(
+            (Message.deleted >> False) &
+            (Message.channel_id == event.channel.id) &
+            (Message.timestamp > (datetime.utcnow() - timedelta(days=13)))
+        ).join(User).order_by(Message.timestamp.desc()).limit(size)
 
-            if mode == 'bots':
-                query = query.where((User.bot >> True))
-            elif mode == 'user':
-                query = query.where((User.user_id == user.id))
+        if mode == 'bots':
+            query = query.where((User.bot >> True))
+        elif mode == 'user':
+            query = query.where((User.user_id == user.id))
 
-            msgs = list(reversed(query))
-            event.channel.delete_messages(msgs)
-            event.msg.reply(':wastebasket: Ok, deleted {} messages'.format(len(msgs))).after(5).delete()
-        finally:
-            lock.release()
+        messages = [i[0] for i in query.tuples()]
 
-    @Plugin.command('add', '<user:user> <role:str> [reason:str...]', level=CommandLevels.MOD, context={'mode': 'add'}, group='role')
-    @Plugin.command('rmv', '<user:user> <role:str> [reason:str...]', level=CommandLevels.MOD, context={'mode': 'remove'}, group='role')
-    @Plugin.command('remove', '<user:user> <role:str> [reason:str...]', level=CommandLevels.MOD, context={'mode': 'remove'}, group='role')
+        if len(messages) > 100:
+            msg = event.msg.reply('Woah there, that will delete a total of {} messages, please confirm.'.format(
+                len(messages)
+            ))
+
+            msg.chain(False).\
+                add_reaction(GREEN_TICK_EMOJI).\
+                add_reaction(RED_TICK_EMOJI)
+
+            try:
+                mra_event = self.wait_for_event(
+                    'MessageReactionAdd',
+                    message_id=msg.id,
+                    conditional=lambda e: (
+                        e.emoji.id in (GREEN_TICK_EMOJI_ID, RED_TICK_EMOJI_ID) and
+                        e.user_id == event.author.id
+                    )).get(timeout=10)
+            except gevent.Timeout:
+                return
+            finally:
+                msg.delete()
+
+            if mra_event.emoji.id != GREEN_TICK_EMOJI_ID:
+                return
+
+            event.msg.reply(':wastebasket: Ok please hold on while I delete those messages...').after(5).delete()
+
+        def run_clean():
+            for chunk in chunks(messages, 100):
+                self.client.api.channels_messages_delete_bulk(event.channel.id, chunk)
+
+        self.cleans[event.channel.id] = gevent.spawn(run_clean)
+        self.cleans[event.channel.id].join()
+        del self.cleans[event.channel.id]
+
+    @Plugin.command(
+        'add',
+        '<user:user> <role:str> [reason:str...]',
+        level=CommandLevels.MOD,
+        context={'mode': 'add'},
+        group='role')
+    @Plugin.command(
+        'rmv',
+        '<user:user> <role:str> [reason:str...]',
+        level=CommandLevels.MOD,
+        context={'mode': 'remove'},
+        group='role')
+    @Plugin.command('remove',
+        '<user:user> <role:str> [reason:str...]',
+        level=CommandLevels.MOD,
+        context={'mode': 'remove'},
+        group='role')
     def role_add(self, event, user, role, reason=None, mode=None):
         role_obj = None
 
         if role.isdigit() and int(role) in event.guild.roles.keys():
             role_obj = event.guild.roles[int(role)]
+        elif role.lower() in event.config.role_aliases:
+            role_obj = event.guild.roles.get(event.config.role_aliases[role.lower()])
         else:
             # First try exact match
             exact_matches = [i for i in event.guild.roles.values() if i.name.lower().replace(' ', '') == role.lower()]
@@ -565,89 +962,146 @@ class AdminPlugin(Plugin):
                         role_obj = rated[0][1]
 
         if not role_obj:
-            return event.msg.reply(':warning: too many matches for that role, try something more exact or the role ID')
+            raise CommandFail('too many matches for that role, try something more exact or the role ID')
 
         author_member = event.guild.get_member(event.author)
-        highest_role = sorted([event.guild.roles.get(r) for r in author_member.roles], key=lambda i: i.position, reverse=True)
-        if not author_member.owner and (not highest_role or highest_role[0].position < role_obj.position):
-            return event.msg.reply(':warning: you can only {} roles that are ranked lower than your highest role'.format(mode))
+        highest_role = sorted(
+            [event.guild.roles.get(r) for r in author_member.roles],
+            key=lambda i: i.position,
+            reverse=True)
+        if not author_member.owner and (not highest_role or highest_role[0].position <= role_obj.position):
+            raise CommandFail('you can only {} roles that are ranked lower than your highest role'.format(mode))
 
         member = event.guild.get_member(user)
         if not member:
-            return event.msg.reply(':warning: invalid member')
+            raise CommandFail('invalid member')
+
+        self.can_act_on(event, member.id)
 
         if mode == 'add' and role_obj.id in member.roles:
-            return event.msg.reply(u':warning: {} already has the {} role'.format(member, role_obj.name))
+            raise CommandFail(u'{} already has the {} role'.format(member, role_obj.name))
         elif mode == 'remove' and role_obj.id not in member.roles:
-            return event.msg.reply(u':warning: {} doesn\'t have the {} role'.format(member, role_obj.name))
+            return CommandFail(u'{} doesn\'t have the {} role'.format(member, role_obj.name))
 
-        self.bot.plugins.get('ModLogPlugin').create_debounce(
-            event, member.user, mode + '_role', actor=event.author, reason=reason or 'no reason')
+        self.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberUpdate'],
+            role_id=role_obj.id,
+        )
 
         if mode == 'add':
             member.add_role(role_obj.id)
         else:
             member.remove_role(role_obj.id)
 
+        self.call(
+            'ModLogPlugin.log_action_ext',
+            (Actions.MEMBER_ROLE_ADD if mode == 'add' else Actions.MEMBER_ROLE_REMOVE),
+            event.guild.id,
+            member=member,
+            role=role_obj,
+            actor=unicode(event.author),
+            reason=reason or 'no reason',
+        )
+
         event.msg.reply(u':ok_hand: {} role {} to {}'.format('added' if mode == 'add' else 'removed',
             role_obj.name,
             member))
 
-    @Plugin.command('msgstats', '<user:user> [ctx:channel|snowflake|str]', level=CommandLevels.MOD)
-    def msgstats(self, event, user, ctx=None):
-        """
-        Displays a users message stats
-        """
-        # TODO
-        return
-        # TODO:  stars?
-        base_query = Message.select().where(
-            (Message.author_id == user.id)
-        )
-
-        if ctx:
-            if isinstance(ctx, Channel):
-                base_query = base_query.where((Message.channel_id == ctx.id))
-            elif isinstance(ctx, int):
-                if ctx not in self.state.guilds:
-                    return event.msg.reply(u':warning: unknown guild {}'.format(C(ctx)))
-                base_query = base_query.where((Message.guild_id == ctx))
-            elif ctx == 'channel':
-                base_query = base_query.where((Message.channel_id == event.channel.id))
-            elif ctx == 'guild':
-                base_query = base_query.where((Message.guild_id == event.guild.id))
-            else:
-                return event.msg.reply(u':warning: invalid context {}'.format(C(ctx)))
-
-        # Grab total messages/characters
-        q = base_query.select(
+    @Plugin.command('stats', '<user:user>', level=CommandLevels.MOD)
+    def msgstats(self, event, user):
+        # Query for the basic aggregate message statistics
+        message_stats = Message.select(
             fn.Count('*'),
             fn.Sum(fn.char_length(Message.content)),
-            fn.Sum(fn.jsonb_array_length(Message.emojis)),
-        ).tuples()[0]
+            fn.Sum(fn.array_length(Message.emojis, 1)),
+            fn.Sum(fn.array_length(Message.mentions, 1)),
+            fn.Sum(fn.array_length(Message.attachments, 1)),
+        ).where(
+            (Message.author_id == user.id)
+        ).tuples().async()
 
-        emojis = list(Message.raw("""
-            SELECT count(i)
+        reactions_given = Reaction.select(
+            fn.Count('*'),
+            Reaction.emoji_id,
+            Reaction.emoji_name,
+        ).join(
+            Message,
+            on=(Message.id == Reaction.message_id)
+        ).where(
+            (Reaction.user_id == user.id)
+        ).group_by(
+            Reaction.emoji_id, Reaction.emoji_name
+        ).order_by(fn.Count('*').desc()).tuples().async()
+
+        # Query for most used emoji
+        emojis = Message.raw('''
+            SELECT gm.emoji_id, gm.name, count(*)
             FROM (
-                SELECT jsonb_array_elements(emojis)
-                FROM messages WHERE author_id=%s
-            ) i
-            GROUP BY i
-        """, (user.id, )).tuples())
+                SELECT unnest(emojis) as id
+                FROM messages
+                WHERE author_id=%s
+            ) q
+            JOIN guild_emojis gm ON gm.emoji_id=q.id
+            GROUP BY 1, 2
+            ORDER BY 3 DESC
+            LIMIT 1
+        ''', (user.id, )).tuples().async()
 
-        deleted = base_query.where((Message.deleted >> True)).count()
+        deleted = Message.select(
+            fn.Count('*')
+        ).where(
+            (Message.author_id == user.id) &
+            (Message.deleted == 1)
+        ).tuples().async()
 
+        wait_many(message_stats, reactions_given, emojis, deleted, timeout=10)
+
+        # If we hit an exception executing the core query, throw an exception
+        if message_stats.exception:
+            message_stats.get()
+
+        q = message_stats.value[0]
         embed = MessageEmbed()
         embed.fields.append(
-            MessageEmbedField(name='Total Messages', value=q[0], inline=True))
+            MessageEmbedField(name='Total Messages Sent', value=q[0] or '0', inline=True))
         embed.fields.append(
-            MessageEmbedField(name='Total Characters', value=q[1], inline=True))
+            MessageEmbedField(name='Total Characters Sent', value=q[1] or '0', inline=True))
+
+        if deleted.value:
+            embed.fields.append(
+                MessageEmbedField(name='Total Deleted Messages', value=deleted.value[0][0], inline=True))
         embed.fields.append(
-            MessageEmbedField(name='Deleted Messages', value=deleted, inline=True))
+            MessageEmbedField(name='Total Custom Emojis', value=q[2] or '0', inline=True))
         embed.fields.append(
-            MessageEmbedField(name='Total Custom Emoji', value=sum(i[0] for i in emojis), inline=True))
+            MessageEmbedField(name='Total Mentions', value=q[3] or '0', inline=True))
         embed.fields.append(
-            MessageEmbedField(name='Unique Emojis Used', value=len(emojis), inline=True))
+            MessageEmbedField(name='Total Attachments', value=q[4] or '0', inline=True))
+
+        if reactions_given.value:
+            reactions_given = reactions_given.value
+
+            embed.fields.append(
+                MessageEmbedField(name='Total Reactions', value=sum(i[0] for i in reactions_given), inline=True))
+
+            emoji = (
+                reactions_given[0][2]
+                if not reactions_given[0][1] else
+                '<:{}:{}>'.format(reactions_given[0][2], reactions_given[0][1])
+            )
+            embed.fields.append(
+                MessageEmbedField(name='Most Used Reaction', value=u'{} (used {} times)'.format(
+                    emoji,
+                    reactions_given[0][0],
+                ), inline=True))
+
+        if emojis.value:
+            emojis = list(emojis.value)
+
+            embed.add_field(
+                name='Most Used Emoji',
+                value=u'<:{1}:{0}> (`{1}`, used {2} times)'.format(*emojis[0]))
 
         embed.thumbnail = MessageEmbedThumbnail(url=user.avatar_url)
         embed.color = get_dominant_colors_user(user)
@@ -656,10 +1110,10 @@ class AdminPlugin(Plugin):
     @Plugin.command('emojistats', '<mode:str> <sort:str>', level=CommandLevels.MOD)
     def emojistats_custom(self, event, mode, sort):
         if mode not in ('server', 'global'):
-            return event.msg.reply(':warning: invalid emoji mode, valid modes are "server" and "global"')
+            raise CommandFail('invalid emoji mode, must be `server` or `global`')
 
         if sort not in ('least', 'most'):
-            return event.msg.reply(':warning: invalid emoji sort, valid sort are "least" and "most"')
+            raise CommandFail('invalid emoji sort, must be `least` or `most`')
 
         order = 'DESC' if sort == 'most' else 'ASC'
 
@@ -677,13 +1131,205 @@ class AdminPlugin(Plugin):
 
         event.msg.reply(tbl.compile())
 
-    @Plugin.listen('GuildBanRemove')
-    def on_guild_ban_remove(self, event):
-        Infraction.update(
-            active=False
+    @Plugin.command('prune', '[uses:int]', level=CommandLevels.ADMIN, group='invites')
+    def invites_prune(self, event, uses=1):
+        invites = [
+            i for i in event.guild.get_invites()
+            if i.uses <= uses and i.created_at < (datetime.utcnow() - timedelta(hours=1))
+        ]
+
+        if not invites:
+            return event.msg.reply('I didn\'t find any invites matching your criteria')
+
+        msg = event.msg.reply(
+            'Ok, a total of {} invites created by {} users with {} total uses would be pruned.'.format(
+                len(invites),
+                len({i.inviter.id for i in invites}),
+                sum(i.uses for i in invites)
+            ))
+
+        msg.chain(False).\
+            add_reaction(GREEN_TICK_EMOJI).\
+            add_reaction(RED_TICK_EMOJI)
+
+        try:
+            mra_event = self.wait_for_event(
+                'MessageReactionAdd',
+                message_id=msg.id,
+                conditional=lambda e: (
+                    e.emoji.id in (GREEN_TICK_EMOJI_ID, RED_TICK_EMOJI_ID) and
+                    e.user_id == event.author.id
+                )).get(timeout=10)
+        except gevent.Timeout:
+            msg.reply('Not executing invite prune')
+            msg.delete()
+            return
+
+        msg.delete()
+
+        if mra_event.emoji.id == GREEN_TICK_EMOJI_ID:
+            msg = msg.reply('Pruning invites...')
+            for invite in invites:
+                invite.delete()
+            msg.edit('Ok, invite prune completed')
+        else:
+            msg = msg.reply('Not pruning invites')
+
+    @Plugin.command(
+        'clean',
+        '<user:user|snowflake> [count:int] [emoji:str]',
+        level=CommandLevels.MOD,
+        group='reactions')
+    def reactions_clean(self, event, user, count=10, emoji=None):
+        if isinstance(user, DiscoUser):
+            user = user.id
+
+        if count > 50:
+            raise CommandFail('cannot clean more than 50 reactions')
+
+        lock = rdb.lock('clean-reactions-{}'.format(user))
+        if not lock.acquire(blocking=False):
+            raise CommandFail('already running a clean on user')
+
+        query = [
+            (Reaction.user_id == user),
+            (Message.guild_id == event.guild.id),
+            (Message.deleted == 0),
+        ]
+
+        if emoji:
+            emoji_id = EMOJI_RE.findall(emoji)
+            if emoji_id:
+                query.append((Reaction.emoji_id == emoji_id[0]))
+            else:
+                # TODO: validation?
+                query.append((Reaction.emoji_name == emoji))
+
+        try:
+            reactions = list(Reaction.select(
+                Reaction.message_id,
+                Reaction.emoji_id,
+                Reaction.emoji_name,
+                Message.channel_id,
+            ).join(
+                Message,
+                on=(Message.id == Reaction.message_id),
+            ).where(
+                reduce(operator.and_, query)
+            ).order_by(Reaction.message_id.desc()).limit(count).tuples())
+
+            if not reactions:
+                raise CommandFail('no reactions to purge')
+
+            msg = event.msg.reply('Hold on while I clean {} reactions'.format(
+                len(reactions)
+            ))
+
+            for message_id, emoji_id, emoji_name, channel_id in reactions:
+                if emoji_id:
+                    emoji = '{}:{}'.format(emoji_name, emoji_id)
+                else:
+                    emoji = emoji_name
+
+                self.client.api.channels_messages_reactions_delete(
+                    channel_id,
+                    message_id,
+                    emoji,
+                    user)
+
+            msg.edit('Ok, I cleaned {} reactions'.format(
+                len(reactions),
+            ))
+        finally:
+            lock.release()
+
+    @Plugin.command('log', '<user:user|snowflake>', group='voice', level=CommandLevels.MOD)
+    def voice_log(self, event, user):
+        if isinstance(user, DiscoUser):
+            user = user.id
+
+        sessions = GuildVoiceSession.select(
+            GuildVoiceSession.user_id,
+            GuildVoiceSession.channel_id,
+            GuildVoiceSession.started_at,
+            GuildVoiceSession.ended_at
         ).where(
-            (Infraction.guild_id == event.guild.id) &
-            (Infraction.user_id == event.user.id) &
-            (Infraction.type_ == Infraction.Types.TEMPBAN) &
-            (Infraction.active == 1)
-        ).execute()
+            (GuildVoiceSession.user_id == user) &
+            (GuildVoiceSession.guild_id == event.guild.id)
+        ).order_by(GuildVoiceSession.started_at.desc()).limit(10)
+
+        tbl = MessageTable()
+        tbl.set_header('Channel', 'Joined At', 'Duration')
+
+        for session in sessions:
+            tbl.add(
+                unicode(self.state.channels.get(session.channel_id) or 'UNKNOWN'),
+                '{} ({} ago)'.format(
+                    session.started_at.isoformat(),
+                    humanize.naturaldelta(datetime.utcnow() - session.started_at)),
+                humanize.naturaldelta(session.ended_at - session.started_at) if session.ended_at else 'Active')
+
+        event.msg.reply(tbl.compile())
+
+    @Plugin.command('join', '<name:str>', aliases=['add', 'give'])
+    def join_role(self, event, name):
+        if not event.config.group_roles:
+            return
+
+        role = event.guild.roles.get(event.config.group_roles.get(name.lower()))
+        if not role:
+            raise CommandFail('invalid or unknown group')
+
+        has_any_admin_perms = any(role.permissions.can(i) for i in (
+            Permissions.KICK_MEMBERS,
+            Permissions.BAN_MEMBERS,
+            Permissions.ADMINISTRATOR,
+            Permissions.MANAGE_CHANNELS,
+            Permissions.MANAGE_GUILD,
+            Permissions.MANAGE_MESSAGES,
+            Permissions.MENTION_EVERYONE,
+            Permissions.MUTE_MEMBERS,
+            Permissions.MOVE_MEMBERS,
+            Permissions.MANAGE_NICKNAMES,
+            Permissions.MANAGE_ROLES,
+            Permissions.MANAGE_WEBHOOKS,
+            Permissions.MANAGE_EMOJIS,
+        ))
+
+        # Sanity check
+        if has_any_admin_perms:
+            raise CommandFail('cannot join group with admin permissions')
+
+        member = event.guild.get_member(event.author)
+        if role.id in member.roles:
+            raise CommandFail('you are already a member of that group')
+
+        member.add_role(role)
+        raise CommandSuccess(u'you have joined the {} group'.format(name))
+
+    @Plugin.command('leave', '<name:snowflake|str>', aliases=['remove', 'take'])
+    def leave_role(self, event, name):
+        if not event.config.group_roles:
+            return
+
+        role_id = event.config.group_roles.get(name.lower())
+        if not role_id or role_id not in event.guild.roles:
+            raise CommandFail('invalid or unknown group')
+
+        member = event.guild.get_member(event.author)
+        if role_id not in member.roles:
+            raise CommandFail('you are not a member of that group')
+
+        member.remove_role(role_id)
+        raise CommandSuccess(u'you have left the {} group'.format(name))
+
+    @Plugin.command('unlock', '<role_id:snowflake>', group='role', level=CommandLevels.ADMIN)
+    def unlock_role(self, event, role_id):
+        if role_id not in event.config.locked_roles:
+            raise CommandFail('role %s is not locked' % role_id)
+
+        if role_id in self.unlocked_roles and self.unlocked_roles[role_id] > time.time():
+            raise CommandFail('role %s is already unlocked' % role_id)
+
+        self.unlocked_roles[role_id] = time.time() + 300
+        raise CommandSuccess('role is unlocked for 5 minutes')

@@ -1,25 +1,34 @@
 import time
 import gevent
-import requests
 import psycopg2
 import markovify
+import pygal
+import cairosvg
 
+from gevent.pool import Pool
 from holster.enum import Enum
 from holster.emitter import Priority
+from datetime import datetime
 
+from disco.types.base import UNSET
 from disco.types.message import MessageTable
 from disco.types.user import User as DiscoUser
 from disco.types.guild import Guild as DiscoGuild
-from disco.types.channel import Channel as DiscoChannel
+from disco.types.channel import Channel as DiscoChannel, MessageIterator
+from disco.util.snowflake import to_datetime, from_datetime
 
 from rowboat.plugins import BasePlugin as Plugin
 from rowboat.sql import database
-from rowboat.models.guild import GuildEmoji
+from rowboat.models.user import User
+from rowboat.models.guild import GuildEmoji, GuildVoiceSession
 from rowboat.models.channel import Channel
 from rowboat.models.message import Message, Reaction
+from rowboat.util.input import parse_duration
 
 
 class SQLPlugin(Plugin):
+    global_plugin = True
+
     def load(self, ctx):
         self.models = ctx.get('models', {})
         self.backfills = {}
@@ -28,6 +37,29 @@ class SQLPlugin(Plugin):
     def unload(self, ctx):
         ctx['models'] = self.models
         super(SQLPlugin, self).unload(ctx)
+
+    @Plugin.listen('VoiceStateUpdate', priority=Priority.BEFORE)
+    def on_voice_state_update(self, event):
+        pre_state = self.state.voice_states.get(event.session_id)
+        GuildVoiceSession.create_or_update(pre_state, event.state)
+
+    @Plugin.listen('PresenceUpdate')
+    def on_presence_update(self, event):
+        updates = {}
+
+        if event.user.avatar != UNSET:
+            updates['avatar'] = event.user.avatar
+
+        if event.user.username != UNSET:
+            updates['username'] = event.user.username
+
+        if event.user.discriminator != UNSET:
+            updates['discriminator'] = int(event.user.discriminator)
+
+        if not updates:
+            return
+
+        User.update(**updates).where((User.user_id == event.user.id)).execute()
 
     @Plugin.listen('MessageCreate')
     def on_message_create(self, event):
@@ -76,10 +108,10 @@ class SQLPlugin(Plugin):
 
     @Plugin.listen('GuildCreate')
     def on_guild_create(self, event):
-        for channel in event.channels.values():
+        for channel in list(event.channels.values()):
             Channel.from_disco_channel(channel)
 
-        for emoji in event.emojis.values():
+        for emoji in list(event.emojis.values()):
             GuildEmoji.from_disco_guild_emoji(emoji, guild_id=event.guild.id)
 
     @Plugin.listen('GuildDelete')
@@ -119,13 +151,9 @@ class SQLPlugin(Plugin):
 
                 result = tbl.compile()
                 if len(result) > 1900:
-                    r = requests.post('http://dpaste.com/api/v2/', data={
-                        'content': result,
-                        'expiry_days': 90,
-                        'poster': 'Rowboat SQL',
-                    })
-                    r.raise_for_status()
-                    return event.msg.reply('{} (_took {}ms_)'.format(r.content.strip() + '.txt', int(dur * 1000)))
+                    return event.msg.reply(
+                        '_took {}ms_'.format(int(dur * 1000)),
+                        attachments=[('result.txt', result)])
 
                 event.msg.reply('```' + result + '```\n_took {}ms_\n'.format(int(dur * 1000)))
         except psycopg2.Error as e:
@@ -182,9 +210,65 @@ class SQLPlugin(Plugin):
         self.models = {}
         event.msg.reply(':ok_hand: cleared models')
 
-    @Plugin.command('backfill channel', '[channel:channel] [mode:str] [direction:str]', level=-1, global_=True)
+    @Plugin.command('message', '<channel:snowflake> <message:snowflake>', level=-1, group='backfill', global_=True)
+    def command_backfill_message(self, event, channel, message):
+        channel = self.state.channels.get(channel)
+        Message.from_disco_message(channel.get_message(message))
+        return event.msg.reply(':ok_hand: backfilled')
+
+    @Plugin.command('reactions', '<message:snowflake>', level=-1, group='backfill', global_=True)
+    def command_sql_reactions(self, event, message):
+        try:
+            message = Message.get(id=message)
+        except Message.DoesNotExist:
+            return event.msg.reply(':warning: no message found')
+
+        message = self.state.channels.get(message.channel_id).get_message(message.id)
+        for reaction in message.reactions:
+            for users in message.get_reactors(reaction.emoji, bulk=True):
+                Reaction.from_disco_reactors(message.id, reaction, (i.id for i in users))
+
+    @Plugin.command('global', '<duration:str> [pool:int]', level=-1, global_=True, context={'mode': 'global'}, group='recover')
+    @Plugin.command('here', '<duration:str> [pool:int]', level=-1, global_=True, context={'mode': 'here'}, group='recover')
+    def command_recover(self, event, duration, pool=4, mode=None):
+        if mode == 'global':
+            channels = list(self.state.channels.values())
+        else:
+            channels = list(event.guild.channels.values())
+
+        start_at = parse_duration(duration, negative=True)
+
+        pool = Pool(pool)
+
+        total = len(channels)
+        count = 0
+        msg = event.msg.reply('Recovery Status: 0/{}'.format(total))
+
+        def updater():
+            last = count
+
+            while True:
+                if last != count:
+                    last = count
+                    msg.edit('Recovery Status: {}/{}'.format(count, total))
+                gevent.sleep(5)
+
+        u = self.spawn(updater)
+
+        try:
+            for channel in channels:
+                pool.wait_available()
+                r = Recovery(self.log, channel, start_at)
+                pool.spawn(r.run)
+                count += 1
+        finally:
+            u.kill()
+
+        msg.edit('RECOVERY COMPLETED')
+
+    @Plugin.command('backfill channel', '[channel:snowflake] [mode:str] [direction:str]', level=-1, global_=True)
     def command_backfill_channel(self, event, channel=None, mode=None, direction=None):
-        channel = channel or event.channel
+        channel = self.state.channels.get(channel) if channel else event.channel
         mode = Backfill.Mode.get(mode) if mode else Backfill.Mode.SPARSE
         direction = Backfill.Direction.get(direction) if direction else Backfill.Direction.UP
 
@@ -242,8 +326,75 @@ class SQLPlugin(Plugin):
         p.join()
         event.msg.reply(u'Completed backfill on {}'.format(guild.name))
 
-    @Plugin.command('words', '<target:user|channel|guild>', level=-1)
-    def words(self, event, target):
+    @Plugin.command('usage', '<word:str> [unit:str] [amount:int]', level=-1, group='words')
+    def words_usage(self, event, word, unit='days', amount=7):
+        sql = '''
+            SELECT date, coalesce(count, 0) AS count
+            FROM
+                generate_series(
+                    NOW() - interval %s,
+                    NOW(),
+                    %s
+                ) AS date
+            LEFT OUTER JOIN (
+                SELECT date_trunc(%s, timestamp) AS dt, count(*) AS count
+                FROM messages
+                WHERE
+                    timestamp >= (NOW() - interval %s) AND
+                    timestamp < (NOW()) AND
+                    guild_id=%s AND
+                    (SELECT count(*) FROM regexp_matches(content, %s)) >= 1
+                GROUP BY dt
+            ) results
+            ON (date_trunc(%s, date) = results.dt);
+        '''
+
+        msg = event.msg.reply(':alarm_clock: One moment pls...')
+
+        start = time.time()
+        tuples = list(Message.raw(
+            sql,
+            '{} {}'.format(amount, unit),
+            '1 {}'.format(unit),
+            unit,
+            '{} {}'.format(amount, unit),
+            event.guild.id,
+            '\s?{}\s?'.format(word),
+            unit
+        ).tuples())
+        sql_duration = time.time() - start
+
+        start = time.time()
+        chart = pygal.Line()
+        chart.title = 'Usage of {} Over {} {}'.format(
+            word, amount, unit,
+        )
+
+        if unit == 'days':
+            chart.x_labels = [i[0].strftime('%a %d') for i in tuples]
+        elif unit == 'minutes':
+            chart.x_labels = [i[0].strftime('%X') for i in tuples]
+        else:
+            chart.x_labels = [i[0].strftime('%x %X') for i in tuples]
+
+        chart.x_labels = [i[0] for i in tuples]
+        chart.add(word, [i[1] for i in tuples])
+
+        pngdata = cairosvg.svg2png(
+            bytestring=chart.render(),
+            dpi=72)
+        chart_duration = time.time() - start
+
+        event.msg.reply(
+            '_SQL: {}ms_ - _Chart: {}ms_'.format(
+                int(sql_duration * 1000),
+                int(chart_duration * 1000),
+            ),
+            attachments=[('chart.png', pngdata)])
+        msg.delete()
+
+    @Plugin.command('top', '<target:user|channel|guild>', level=-1, group='words')
+    def words_top(self, event, target):
         if isinstance(target, DiscoUser):
             q = 'author_id'
         elif isinstance(target, DiscoChannel):
@@ -269,12 +420,35 @@ class SQLPlugin(Plugin):
         t = MessageTable()
         t.set_header('Word', 'Count')
 
-        for word, count in Message.raw(sql, (target.id, )).tuples():
+        for word, count in Message.raw(sql, target.id).tuples():
             if '```' in word:
                 continue
             t.add(word, count)
 
         event.msg.reply(t.compile())
+
+
+class Recovery(object):
+    def __init__(self, log, channel, start_dt, end_dt=None):
+        self.log = log
+        self.channel = channel
+        self.start_dt = start_dt
+        self.end_dt = end_dt or datetime.utcnow()
+
+    def run(self):
+        self.log.info('Starting recovery on channel %s (%s -> %s)', self.channel.id, self.start_dt, self.end_dt)
+
+        msgs = self.channel.messages_iter(
+            bulk=True,
+            direction=MessageIterator.Direction.DOWN,
+            after=str(from_datetime(self.start_dt))
+        )
+
+        for chunk in msgs:
+            Message.from_disco_message_many(chunk, safe=True)
+
+            if to_datetime(chunk[-1].id) > self.end_dt:
+                break
 
 
 class Backfill(object):

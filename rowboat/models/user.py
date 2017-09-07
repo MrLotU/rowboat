@@ -2,6 +2,7 @@ from datetime import datetime
 from holster.enum import Enum
 from peewee import BigIntegerField, IntegerField, SmallIntegerField, TextField, BooleanField, DateTimeField
 from playhouse.postgres_ext import BinaryJSONField
+
 from rowboat.sql import BaseModel
 
 
@@ -97,6 +98,8 @@ class Infraction(BaseModel):
         'BAN',
         'TEMPMUTE',
         'UNBAN',
+        'TEMPROLE',
+        'WARNING',
         bitmask=False,
     )
 
@@ -116,18 +119,56 @@ class Infraction(BaseModel):
         db_table = 'infractions'
 
         indexes = (
-            (('guild', 'user_id'), False),
+            (('guild_id', 'user_id'), False),
         )
 
-    # TODO: debounces should not blow dick here, use real types n such
+    @staticmethod
+    def admin_config(event):
+        return getattr(event.base_config.plugins, 'admin', None)
+
+    @classmethod
+    def temprole(cls, plugin, event, member, role_id, reason, expires_at):
+        User.from_disco_user(member.user)
+
+        # TODO: modlog
+
+        member.add_role(role_id, reason=reason)
+
+        cls.create(
+            guild_id=event.guild.id,
+            user_id=member.user.id,
+            actor_id=event.author.id,
+            type_=cls.Types.TEMPROLE,
+            reason=reason,
+            expires_at=expires_at,
+            metadata={'role': role_id})
 
     @classmethod
     def kick(cls, plugin, event, member, reason):
+        from rowboat.plugins.modlog import Actions
+
         User.from_disco_user(member.user)
-        plugin.bot.plugins.get('ModLogPlugin').create_debounce(event, member.user, 'kick',
-            actor=unicode(event.author),
-            reason=reason or 'no reason')
-        member.kick()
+
+        # Prevent the GuildMemberRemove log event from triggering
+        plugin.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberRemove'],
+            user_id=member.user.id
+        )
+
+        member.kick(reason=reason)
+
+        # Create a kick modlog event
+        plugin.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_KICk,
+            event.guild.id,
+            member=member,
+            actor=unicode(event.author) if event.author.id != member.id else 'Automatic',
+            reason=reason or 'no reason'
+        )
+
         cls.create(
             guild_id=member.guild_id,
             user_id=member.user.id,
@@ -137,15 +178,27 @@ class Infraction(BaseModel):
 
     @classmethod
     def tempban(cls, plugin, event, member, reason, expires_at):
+        from rowboat.plugins.modlog import Actions
         User.from_disco_user(member.user)
 
-        plugin.bot.plugins.get('ModLogPlugin').create_debounce(event, member.user, 'ban_reason',
-            actor=unicode(event.author),
-            temp=True,
-            expires=expires_at,
-            reason=reason or 'no reason')
+        plugin.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberRemove', 'GuildBanAdd'],
+            user_id=member.user.id
+        )
 
-        member.ban()
+        member.ban(reason=reason)
+
+        plugin.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_TEMPBAN,
+            event.guild.id,
+            member=member,
+            actor=unicode(event.author) if event.author.id != member.id else 'Automatic',
+            reason=reason or 'no reason',
+            expires=expires_at,
+        )
 
         cls.create(
             guild_id=member.guild_id,
@@ -157,15 +210,28 @@ class Infraction(BaseModel):
 
     @classmethod
     def softban(cls, plugin, event, member, reason):
+        from rowboat.plugins.modlog import Actions
         User.from_disco_user(member.user)
-        plugin.bot.plugins.get('ModLogPlugin').create_debounce(event, member.user, 'ban_reason',
-            actor=unicode(event.author),
-            temp=True,
-            expires=None,
-            reason=reason or 'no reason')
 
-        member.ban(delete_message_days=7)
-        member.unban()
+        plugin.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberRemove', 'GuildBanAdd', 'GuildBanRemove'],
+            user_id=member.user.id
+        )
+
+        member.ban(delete_message_days=7, reason=reason)
+        member.unban(reason=reason)
+
+        plugin.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_SOFTBAN,
+            event.guild.id,
+            member=member,
+            actor=unicode(event.author) if event.author.id != member.id else 'Automatic',
+            reason=reason or 'no reason'
+        )
+
         cls.create(
             guild_id=member.guild_id,
             user_id=member.user.id,
@@ -175,20 +241,31 @@ class Infraction(BaseModel):
 
     @classmethod
     def ban(cls, plugin, event, member, reason, guild):
+        from rowboat.plugins.modlog import Actions
         if isinstance(member, (int, long)):
             user_id = member
         else:
             User.from_disco_user(member.user)
             user_id = member.user.id
 
-        if user_id != member:
-            plugin.bot.plugins.get('ModLogPlugin').create_debounce(event, member.user, 'ban_reason',
-                actor=unicode(event.author),
-                temp=False,
-                expires=None,
-                reason=reason or 'no reason')
+        plugin.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberRemove', 'GuildBanAdd'],
+            user_id=user_id,
+        )
 
-        guild.create_ban(user_id)
+        guild.create_ban(user_id, reason=reason)
+
+        plugin.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_BAN,
+            event.guild.id,
+            user=unicode(member),
+            user_id=user_id,
+            actor=unicode(event.author) if event.author.id != user_id else 'Automatic',
+            reason=reason or 'no reason'
+        )
 
         cls.create(
             guild_id=guild.id,
@@ -198,27 +275,87 @@ class Infraction(BaseModel):
             reason=reason)
 
     @classmethod
+    def warn(cls, plugin, event, member, reason, guild):
+        from rowboat.plugins.modlog import Actions
+        User.from_disco_user(member.user)
+        user_id = member.user.id
+
+        cls.create(
+            guild_id=guild.id,
+            user_id=user_id,
+            actor_id=event.author.id,
+            type_=cls.Types.WARNING,
+            reason=reason)
+
+        plugin.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_WARNED,
+            event.guild.id,
+            member=member,
+            actor=unicode(event.author) if event.author.id != member.id else 'Automatic',
+            reason=reason or 'no reason'
+        )
+
+    @classmethod
     def mute(cls, plugin, event, member, reason):
-        plugin.bot.plugins.get('ModLogPlugin').create_debounce(
-            event, member.user, 'muted', reason=reason, expires_at=None, actor=unicode(event.author), role=event.config.mute_role)
-        member.add_role(event.config.mute_role)
+        from rowboat.plugins.modlog import Actions
+        admin_config = cls.admin_config(event)
+
+        plugin.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberUpdate'],
+            user_id=member.user.id,
+            role_id=admin_config.mute_role,
+        )
+
+        member.add_role(admin_config.mute_role, reason=reason)
+
+        plugin.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_MUTED,
+            event.guild.id,
+            member=member,
+            actor=unicode(event.author) if event.author.id != member.id else 'Automatic',
+            reason=reason or 'no reason'
+        )
+
         cls.create(
             guild_id=event.guild.id,
             user_id=member.user.id,
             actor_id=event.author.id,
             type_=cls.Types.MUTE,
             reason=reason,
-            metadata={'role': event.config.mute_role})
+            metadata={'role': admin_config.mute_role})
 
     @classmethod
     def tempmute(cls, plugin, event, member, reason, expires_at):
-        plugin.bot.plugins.get('ModLogPlugin').create_debounce(
-            event, member.user, 'muted', reason=reason, expires_at=expires_at, actor=unicode(event.author), role=(
-                event.config.temp_mute_role or event.config.mute_role
-            ))
+        from rowboat.plugins.modlog import Actions
+        admin_config = cls.admin_config(event)
 
-        role = (event.config.temp_mute_role or event.config.mute_role)
-        member.add_role(role)
+        if not admin_config.mute_role:
+            plugin.log.warning('Cannot tempmute member %s, no tempmute role', member.id)
+            return
+
+        plugin.call(
+            'ModLogPlugin.create_debounce',
+            event,
+            ['GuildMemberUpdate'],
+            user_id=member.user.id,
+            role_id=admin_config.mute_role,
+        )
+
+        member.add_role(admin_config.mute_role, reason=reason)
+
+        plugin.call(
+            'ModLogPlugin.log_action_ext',
+            Actions.MEMBER_TEMP_MUTED,
+            event.guild.id,
+            member=member,
+            actor=unicode(event.author) if event.author.id != member.id else 'Automatic',
+            reason=reason or 'no reason',
+            expires=expires_at,
+        )
 
         cls.create(
             guild_id=event.guild.id,
@@ -227,7 +364,22 @@ class Infraction(BaseModel):
             type_=cls.Types.TEMPMUTE,
             reason=reason,
             expires_at=expires_at,
-            metadata={'role': role})
+            metadata={'role': admin_config.mute_role})
+
+    @classmethod
+    def clear_active(cls, event, user_id, types):
+        """
+        Marks a previously active tempmute as inactive for the given event/user.
+        This should be used in all locations where we either think this is no
+        longer active (e.g. the mute role was removed) _or_ when we don't want to
+        unmute the user any longer, e.g. they've been remuted by another command.
+        """
+        return cls.update(active=False).where(
+            (cls.guild_id == event.guild.id) &
+            (cls.user_id == user_id) &
+            (cls.type_ << types) &
+            (cls.active == 1)
+        ).execute() >= 1
 
 
 @BaseModel.register
@@ -235,3 +387,8 @@ class StarboardBlock(BaseModel):
     guild_id = BigIntegerField()
     user_id = BigIntegerField()
     actor_id = BigIntegerField()
+
+    class Meta:
+        indexes = (
+            (('guild_id', 'user_id'), True),
+        )

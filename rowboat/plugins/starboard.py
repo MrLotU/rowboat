@@ -1,20 +1,19 @@
 import peewee
 
-from peewee import fn
+from peewee import fn, JOIN
 from datetime import datetime, timedelta
 
 from disco.bot import CommandLevels
+from disco.api.http import APIException
 from disco.types.message import MessageEmbed
 
-from rowboat.plugins import RowboatPlugin as Plugin
+from rowboat.plugins import RowboatPlugin as Plugin, CommandFail
 from rowboat.types.plugin import PluginConfig
 from rowboat.types import ChannelField, Field, SlottedModel, ListField, DictField
 from rowboat.models.user import StarboardBlock, User
 from rowboat.models.message import StarboardEntry, Message
 from rowboat.util.timing import Debounce
-
-
-STAR_EMOJI = u'\U00002B50'
+from rowboat.constants import STAR_EMOJI, ERR_UNKNOWN_MESSAGE
 
 
 def is_star_event(e):
@@ -34,6 +33,9 @@ class ChannelConfig(SlottedModel):
 
     # The number which represents the "max" star level
     star_color_max = Field(int, default=15)
+
+    # Prevent users from starring their own posts
+    prevent_self_star = Field(bool, default=False)
 
     def get_color(self, count):
         ratio = min(count / float(self.star_color_max), 1.0)
@@ -67,65 +69,85 @@ class StarboardPlugin(Plugin):
         self.updates = {}
         self.locks = {}
 
+    @Plugin.command('show', '<mid:snowflake>', group='stars', level=CommandLevels.TRUSTED)
+    def stars_show(self, event, mid):
+        try:
+            star = StarboardEntry.select().join(Message).where(
+                (Message.guild_id == event.guild.id) &
+                (~(StarboardEntry.star_message_id >> None)) &
+                (
+                    (Message.id == mid) |
+                    (StarboardEntry.star_message_id == mid)
+                )
+            ).get()
+        except StarboardEntry.DoesNotExist:
+            raise CommandFail('no starboard message with that id')
+
+        _, sb_config = event.config.get_board(star.message.channel_id)
+
+        try:
+            source_msg = self.client.api.channels_messages_get(
+                star.message.channel_id,
+                star.message_id)
+        except:
+            raise CommandFail('no starboard message with that id')
+
+        content, embed = self.get_embed(star, source_msg, sb_config)
+        event.msg.reply(content, embed=embed)
+
     @Plugin.command('stats', '[user:user]', group='stars', level=CommandLevels.MOD)
     def stars_stats(self, event, user=None):
         if user:
             try:
-                given_stars_posts, given_stars_total = list(StarboardEntry.select(
+                given_stars = list(StarboardEntry.select(
                     fn.COUNT('*'),
-                    fn.SUM(fn.array_length(StarboardEntry.stars, 1)),
-                ).where(
+                ).join(Message).where(
                     (~ (StarboardEntry.star_message_id >> None)) &
-                    (StarboardEntry.stars.contains(user.id))
-                ).tuples())[0]
+                    (StarboardEntry.stars.contains(user.id)) &
+                    (Message.guild_id == event.guild.id)
+                ).tuples())[0][0]
 
                 recieved_stars_posts, recieved_stars_total = list(StarboardEntry.select(
                     fn.COUNT('*'),
                     fn.SUM(fn.array_length(StarboardEntry.stars, 1)),
                 ).join(Message).where(
                     (~ (StarboardEntry.star_message_id >> None)) &
-                    (Message.author_id == user.id)
+                    (Message.author_id == user.id) &
+                    (Message.guild_id == event.guild.id)
                 ).tuples())[0]
-
-                recieved_stars_rank = list(StarboardEntry.select(
-                    fn.RANK().over(
-                        partition_by=[Message.author_id],
-                        order_by=[fn.SUM(fn.array_length(StarboardEntry.stars, 1))]).alias('rank')
-                ).join(Message).where(
-                    (~ (StarboardEntry.star_message_id >> None)) &
-                    (StarboardEntry.stars.contains(user.id))
-                ).group_by(Message.author_id).limit(1).tuples())[0][0]
             except:
-                event.msg.reply(':warning: failed to crunch the numbers on that user')
-                raise
+                return event.msg.reply(':warning: failed to crunch the numbers on that user')
 
             embed = MessageEmbed()
             embed.color = 0xffd700
             embed.title = user.username
             embed.set_thumbnail(url=user.avatar_url)
-            embed.add_field(name='Total Stars Given', value=given_stars_total, inline=True)
-            embed.add_field(name='Total Starred Posts', value=given_stars_posts, inline=True)
-            embed.add_field(name='Total Posts w/ Stars', value=recieved_stars_posts, inline=True)
-            embed.add_field(name='Total Stars Recieved', value=recieved_stars_total, inline=True)
-            embed.add_field(name='Star Rank', value='#{}'.format(recieved_stars_rank), inline=True)
-            event.msg.reply('', embed=embed)
-            return
+            embed.add_field(name='Total Stars Given', value=str(given_stars), inline=True)
+            embed.add_field(name='Total Posts w/ Stars', value=str(recieved_stars_posts), inline=True)
+            embed.add_field(name='Total Stars Recieved', value=str(recieved_stars_total), inline=True)
+            # embed.add_field(name='Star Rank', value='#{}'.format(recieved_stars_rank), inline=True)
+            return event.msg.reply('', embed=embed)
 
         total_starred_posts, total_stars = list(StarboardEntry.select(
             fn.COUNT('*'),
             fn.SUM(fn.array_length(StarboardEntry.stars, 1)),
-        ).where(
-            (~ (StarboardEntry.star_message_id >> None))
+        ).join(Message).where(
+            (~ (StarboardEntry.star_message_id >> None)) &
+            (StarboardEntry.blocked == 0) &
+            (Message.guild_id == event.guild.id)
         ).tuples())[0]
 
-        top_users = list(StarboardEntry.select(fn.COUNT('*'), User.user_id).join(
+        top_users = list(StarboardEntry.select(fn.SUM(fn.array_length(StarboardEntry.stars, 1)), User.user_id).join(
             Message,
         ).join(
             User,
-            on=(Message.author_id == User.user_id)
+            on=(Message.author_id == User.user_id),
         ).where(
-            (~ (StarboardEntry.star_message_id >> None))
-        ).group_by(User).order_by(fn.COUNT('*').desc()).limit(5).tuples())
+            (~ (StarboardEntry.star_message_id >> None)) &
+            (fn.array_length(StarboardEntry.stars, 1) > 0) &
+            (StarboardEntry.blocked == 0) &
+            (Message.guild_id == event.guild.id)
+        ).group_by(User).order_by(fn.SUM(fn.array_length(StarboardEntry.stars, 1)).desc()).limit(5).tuples())
 
         embed = MessageEmbed()
         embed.color = 0xffd700
@@ -139,14 +161,37 @@ class StarboardPlugin(Plugin):
 
     @Plugin.command('check', '<mid:snowflake>', group='stars', level=CommandLevels.ADMIN)
     def stars_update(self, event, mid):
-        StarboardEntry.update(
-            dirty=True
-        ).where(
-            (StarboardEntry.message_id == mid)
-        ).execute()
+        try:
+            entry = StarboardEntry.select(StarboardEntry, Message).join(
+                Message
+            ).where(
+                (Message.guild_id == event.guild.id) &
+                (StarboardEntry.message_id == mid)
+            ).get()
+        except StarboardEntry.DoesNotExist:
+            return event.msg.reply(':warning: no starboard entry exists with that message id')
+
+        msg = self.client.api.channels_messages_get(
+            entry.message.channel_id,
+            entry.message_id)
+
+        users = [i.id for i in msg.get_reactors(STAR_EMOJI)]
+
+        if set(users) != set(entry.stars):
+            StarboardEntry.update(
+                stars=users,
+                dirty=True
+            ).where(
+                (StarboardEntry.message_id == entry.message_id)
+            ).execute()
+        else:
+            StarboardEntry.update(
+                dirty=True
+            ).where(
+                (StarboardEntry.message_id == mid)
+            ).execute()
 
         self.queue_update(event.guild.id, event.config)
-
         event.msg.reply(u'Forcing an update on message {}'.format(mid))
 
     @Plugin.command('block', '<user:user>', group='stars', level=CommandLevels.MOD)
@@ -197,6 +242,25 @@ class StarboardPlugin(Plugin):
             user,
         ))
 
+    @Plugin.command('unhide', '<mid:snowflake>', group='stars', level=CommandLevels.MOD)
+    def stars_unhide(self, event, mid):
+        count = StarboardEntry.update(
+            blocked=False,
+            dirty=True,
+        ).where(
+            (StarboardEntry.message_id == mid) &
+            (StarboardEntry.blocked == 1)
+        ).execute()
+
+        if not count:
+            event.msg.reply(u'No hidden starboard message with that ID')
+            return
+
+        self.queue_update(event.guild.id, event.config)
+        event.msg.reply(u'Message {} has been unhidden from the starboard'.format(
+            mid,
+        ))
+
     @Plugin.command('hide', '<mid:snowflake>', group='stars', level=CommandLevels.MOD)
     def stars_hide(self, event, mid):
         count = StarboardEntry.update(
@@ -211,31 +275,34 @@ class StarboardPlugin(Plugin):
             return
 
         self.queue_update(event.guild.id, event.config)
-        event.msg.reply(u'Message {} has been hidden from the starboard')
+        event.msg.reply(u'Message {} has been hidden from the starboard'.format(
+            mid,
+        ))
 
     @Plugin.command('update', group='stars', level=CommandLevels.ADMIN)
     def force_update_stars(self, event):
         # First, iterate over stars and repull their reaction count
-        stars = StarboardEntry.select().join(Message).where(
+        stars = StarboardEntry.select(StarboardEntry, Message).join(
+            Message
+        ).where(
             (Message.guild_id == event.guild.id) &
             (~ (StarboardEntry.star_message_id >> None))
         ).order_by(Message.timestamp.desc()).limit(100)
 
-        msg = event.msg.reply('Updating starboard...')
+        info_msg = event.msg.reply('Updating starboard...')
 
         for star in stars:
-            self.log.info('Attempting to update stars for %s', star.message_id)
-            info_msg = self.client.api.channels_messages_get(
+            msg = self.client.api.channels_messages_get(
                 star.message.channel_id,
                 star.message_id)
 
             users = [i.id for i in msg.get_reactors(STAR_EMOJI)]
 
             if set(users) != set(star.stars):
-                self.log.warning('star %s had outdated reactors list %s vs %s',
+                self.log.warning('star %s had outdated reactors list (%s vs %s)',
                     star.message_id,
-                    users,
-                    star.stars)
+                    len(users),
+                    len(star.stars))
 
                 StarboardEntry.update(
                     stars=users,
@@ -244,8 +311,9 @@ class StarboardPlugin(Plugin):
                     (StarboardEntry.message_id == star.message_id)
                 ).execute()
 
-        info_msg.edit('Starboard updated!')
         self.queue_update(event.guild.id, event.config)
+        info_msg.delete()
+        event.msg.reply(':ballot_box_with_check: Starboard Updated!')
 
     @Plugin.command('lock', group='stars', level=CommandLevels.ADMIN)
     def lock_stars(self, event):
@@ -276,8 +344,6 @@ class StarboardPlugin(Plugin):
             self.updates[guild_id].touch()
 
     def update_starboard(self, guild_id, config):
-        self.log.info('Attempting to update starboard %s / %s', guild_id, config)
-
         # Grab all dirty stars that where posted in the last 32 hours
         stars = StarboardEntry.select().join(Message).where(
             (StarboardEntry.dirty == 1) &
@@ -313,7 +379,9 @@ class StarboardPlugin(Plugin):
                 continue
 
             # If we previously posted this in the wrong starboard, delete it
-            if star.star_channel_id and (star.star_channel_id != sb_id or len(star.stars) < sb_config.min_stars) or star.blocked:
+            if star.star_channel_id and (
+                    star.star_channel_id != sb_id or
+                    len(star.stars) < sb_config.min_stars) or star.blocked:
                 self.delete_star(star, update=True)
 
             if len(star.stars) < sb_config.min_stars or star.blocked:
@@ -323,7 +391,6 @@ class StarboardPlugin(Plugin):
             self.post_star(star, source_msg, sb_id, sb_config)
 
     def delete_star(self, star, update=True):
-        self.log.info('Removing starboard entry %s', star)
         try:
             self.client.api.channels_messages_delete(
                 star.star_channel_id,
@@ -346,8 +413,6 @@ class StarboardPlugin(Plugin):
             star.star_message_id = None
 
     def post_star(self, star, source_msg, starboard_id, config):
-        self.log.info('Posting starboard entry for %s', star)
-
         # Generate the embed and post it
         content, embed = self.get_embed(star, source_msg, config)
 
@@ -361,11 +426,20 @@ class StarboardPlugin(Plugin):
                 self.log.exception('Failed to post starboard message: ')
                 return
         else:
-            msg = self.client.api.channels_messages_modify(
-                star.star_channel_id,
-                star.star_message_id,
-                content,
-                embed=embed)
+            try:
+                msg = self.client.api.channels_messages_modify(
+                    star.star_channel_id,
+                    star.star_message_id,
+                    content,
+                    embed=embed)
+            except APIException as e:
+                # If we get a 10008, assume this message was deleted
+                if e.code == ERR_UNKNOWN_MESSAGE:
+                    star.star_message_id = None
+                    star.star_channel_id = None
+
+                    # Recurse so we repost
+                    return self.post_star(star, source_msg, starboard_id, config)
 
         # Update our starboard entry
         StarboardEntry.update(
@@ -378,13 +452,40 @@ class StarboardPlugin(Plugin):
 
     @Plugin.listen('MessageReactionAdd', conditional=is_star_event)
     def on_message_reaction_add(self, event):
-        q = StarboardBlock.select().where(
-            (StarboardBlock.user_id == event.user_id) &
-            (StarboardBlock.guild_id == event.guild.id)
-        ).exists()
+        try:
+            # Grab the message, and JOIN across blocks to check if a block exists
+            #  for either the message author or the reactor.
+            msg = Message.select(
+                Message,
+                StarboardBlock
+            ).join(
+                StarboardBlock,
+                join_type=JOIN.LEFT_OUTER,
+                on=(
+                    (
+                        (Message.author_id == StarboardBlock.user_id) |
+                        (StarboardBlock.user_id == event.user_id)
+                    ) &
+                    (Message.guild_id == StarboardBlock.guild_id)
+                )
+            ).where(
+                (Message.id == event.message_id)
+            ).get()
+        except Message.DoesNotExist:
+            return
 
-        # Don't add stars for blocked users
-        if q:
+        # If either the reaction or message author is blocked, prevent this action
+        if msg.starboardblock.user_id:
+            event.delete()
+            return
+
+        # Check if the board prevents self stars
+        sb_id, board = event.config.get_board(event.channel_id)
+        if not sb_id:
+            return
+
+        if board.prevent_self_star and msg.author_id == event.user_id:
+            event.delete()
             return
 
         try:
@@ -443,8 +544,6 @@ class StarboardPlugin(Plugin):
             stars = list(StarboardEntry.delete().where(
                 (StarboardEntry.message_id == event.id)
             ).returning(StarboardEntry).execute())
-
-            self.log.info('Clearing stars for (%s) on deletion: %s', event.id, stars)
 
             for star in stars:
                 self.delete_star(star, update=False)

@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import time
 import gevent
 
@@ -12,34 +14,27 @@ class Eventual(object):
 
     def __init__(self, func):
         self.func = func
-        self.lock = Semaphore()
-
         self._next = None
         self._t = None
 
     def wait(self, nxt):
         def f():
-            gevent.sleep((self._next - datetime.utcnow()).seconds)
+            wait_time = (self._next - datetime.utcnow())
+            gevent.sleep(wait_time.seconds + (wait_time.microseconds / 1000000.0))
+            self._next = None
+            gevent.spawn(self.func)
 
-            with self.lock:
-                self._t = None
-                self.func()
+        if self._t:
+            self._t.kill()
 
-        with self.lock:
-            if self._t:
-                self._t.kill()
-                self._t = None
-
-            self._next = nxt
-            gevent.spawn(f)
+        self._next = nxt
+        self._t = gevent.spawn(f)
 
     def trigger(self):
-        with self.lock:
-            if self._t:
-                self._t.kill()
-                self._t = None
-                self._next = None
-            self.func()
+        if self._t:
+            self._t.kill()
+        self._next = None
+        gevent.spawn(self.func)
 
     def set_next_schedule(self, date):
         if date < datetime.utcnow():
