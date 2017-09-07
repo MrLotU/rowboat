@@ -36,7 +36,7 @@ from rowboat.constants import (
 PY_CODE_BLOCK = u'```py\n{}\n```'
 
 BOT_INFO = '''
-Rowboat is a moderation and utilitarian bot built for large Discord servers.
+Rowboat is a moderation and utilitarian bot built for large Discord servers. Created by **b1nzy#1337** hosted and modified by **LordOfTheUndead#7368**
 '''
 
 GUILDS_WAITING_SETUP_KEY = 'gws'
@@ -289,7 +289,7 @@ class CorePlugin(Plugin):
         try:
             yield embed
             self.bot.client.api.channels_messages_create(
-                290924692057882635 if ENV == 'prod' else 301869081714491393,
+                346248432299671553 if ENV == 'prod' else 346248472657395743,
                 '',
                 embed=embed
             )
