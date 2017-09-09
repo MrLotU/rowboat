@@ -36,7 +36,7 @@ from rowboat.constants import (
 PY_CODE_BLOCK = u'```py\n{}\n```'
 
 BOT_INFO = '''
-Rowboat is a moderation and utilitarian bot built for large Discord servers. Created by **b1nzy#1337** hosted and modified by **LordOfTheUndead#7368**
+Rowboat is a moderation and utilitarian bot built for large Discord servers. Created by **b1nzy#1337**, hosted and modified by **LordOfTheUndead#7368**
 '''
 
 GUILDS_WAITING_SETUP_KEY = 'gws'
