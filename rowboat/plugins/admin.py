@@ -87,7 +87,6 @@ class AdminConfig(PluginConfig):
 
     # Group roles can be joined/left by any user
     group_roles = DictField(lambda value: unicode(value).lower(), snowflake)
-    group_confirm_reactions = Field(bool, default=False)
 
     # Locked roles cannot be changed unless they are unlocked w/ command
     locked_roles = ListField(snowflake)
@@ -854,7 +853,7 @@ class AdminPlugin(Plugin):
         archive = MessageArchive.create_from_message_ids([i.id for i in q])
         event.msg.reply('OK, archived {} messages at {}'.format(len(archive.message_ids), archive.url))
 
-    @Plugin.command('extend', '<archive_id:str> <duration:str>', level=CommandLevels.MOD, group='archive')
+    @Plugin.command('extend', '<archive:str> <duration:str>', level=CommandLevels.MOD, group='archive')
     def archive_extend(self, event, archive_id, duration):
         try:
             archive = MessageArchive.get(archive_id=archive_id)
@@ -1328,9 +1327,6 @@ class AdminPlugin(Plugin):
             raise CommandFail('you are already a member of that group')
 
         member.add_role(role)
-        if self.config.group_confirm_reactions:
-            event.msg.add_reaction(GREEN_TICK_EMOJI_ID)
-            return
         raise CommandSuccess(u'you have joined the {} group'.format(name))
 
     @Plugin.command('leave', '<name:snowflake|str>', aliases=['remove', 'take'])
@@ -1347,9 +1343,6 @@ class AdminPlugin(Plugin):
             raise CommandFail('you are not a member of that group')
 
         member.remove_role(role_id)
-        if self.config.group_confirm_reactions:
-            event.msg.add_reaction(GREEN_TICK_EMOJI_ID)
-            return
         raise CommandSuccess(u'you have left the {} group'.format(name))
 
     @Plugin.command('unlock', '<role_id:snowflake>', group='role', level=CommandLevels.ADMIN)
