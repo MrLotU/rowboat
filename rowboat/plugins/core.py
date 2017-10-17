@@ -468,7 +468,7 @@ class CorePlugin(Plugin):
                 except CommandResponse as e:
                     event.reply(e.response)
                 except:
-                    Command.track(event, command, exception=True)
+                    tracked = Command.track(event, command, exception=True)
                     self.log.exception('Command error:')
                     
                     with self.send_control_message() as embed:
