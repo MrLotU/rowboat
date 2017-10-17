@@ -470,7 +470,7 @@ class CorePlugin(Plugin):
                 except:
                     tracked = Command.track(event, command, exception=True)
                     self.log.exception('Command error:')
-                    
+
                     with self.send_control_message() as embed:
                         embed.title = u'Command Error: {}'.format(command.name)
                         embed.color = 0xff6961
@@ -481,8 +481,9 @@ class CorePlugin(Plugin):
                             event.channel.id
                         ), inline=True)
                         embed.description = '```{}```'.format(u'\n'.join(tracked.traceback.split('\n')[-8:]))
-                    
+
                     return event.reply('<:{}> something went wrong, perhaps try again later'.format(RED_TICK_EMOJI))
+
 
             Command.track(event, command)
 
