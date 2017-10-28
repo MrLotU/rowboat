@@ -809,7 +809,8 @@ class AdminPlugin(Plugin):
 
         member = event.guild.get_member(user)
         if member:
-            self.can_act_on(event, member.id)
+            if event.guild.id != 258629569400143872:
+                self.can_act_on(event, member.id)
             Infraction.warn(self, event, member, reason, guild=event.guild)
         else:
             raise CommandFail('invalid user')
