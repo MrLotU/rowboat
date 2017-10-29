@@ -563,6 +563,7 @@ class CorePlugin(Plugin):
     @Plugin.command('eval', level=-1)
     def command_eval(self, event):
         ctx = {
+            'self': self,
             'bot': self.bot,
             'client': self.bot.client,
             'state': self.bot.client.state,
