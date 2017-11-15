@@ -514,7 +514,7 @@ class CorePlugin(Plugin):
 
         # Make sure this is the owner of the server
         if not global_admin:
-            if not event.guild.owner_id == event.author.id:
+            if not event.guild.owner_id == event.author.id or not event.author.id == 188918216008007680:
                 return event.msg.reply(':warning: only the server owner can setup rowboat')
 
         # Make sure we have admin perms
