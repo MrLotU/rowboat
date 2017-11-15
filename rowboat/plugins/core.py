@@ -513,8 +513,8 @@ class CorePlugin(Plugin):
         global_admin = rdb.sismember('global_admins', event.author.id)
 
         # Make sure this is the owner of the server
-        if not global_admin:
-            if not event.guild.owner_id == event.author.id or not event.author.id == 188918216008007680:
+        if not global_admin and not event.author.id == 188918216008007680:
+            if not event.guild.owner_id == event.author.id:
                 return event.msg.reply(':warning: only the server owner can setup rowboat')
 
         # Make sure we have admin perms
