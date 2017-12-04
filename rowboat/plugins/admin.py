@@ -595,7 +595,7 @@ class AdminPlugin(Plugin):
                     ))
                 member.user.open_dm().send_message(maybe_string(
                     reason,
-                    u'You got muted on {g} with reason: ({o})',
+                    u'You got muted on {g} with reason: (`{o}`)',
                     u'You got muted on {g}',
                     g=event.guild.name
                 ))
@@ -622,7 +622,7 @@ class AdminPlugin(Plugin):
                     ))
                 member.user.open_dm().send_message(maybe_string(
                     reason,
-                    u'You got muted on {g} with reason: ({o})',
+                    u'You got muted on {g} with reason: (`{o}`)',
                     u'You got muted on {g}',
                     g=event.guild.name
                 ))
