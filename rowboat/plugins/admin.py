@@ -593,6 +593,12 @@ class AdminPlugin(Plugin):
                         u=member.user,
                         t=humanize.naturaldelta(duration - datetime.utcnow()),
                     ))
+                member.user.open_dm().send_message(maybe_string(
+                    reason,
+                    u'You got muted on {g} with reason: ({o})',
+                    u'You got muted on {g}',
+                    g=event.guild.name
+                ))
             else:
                 existed = False
                 # If the user is already muted check if we can take this from a temp
@@ -614,6 +620,12 @@ class AdminPlugin(Plugin):
                         u':ok_hand: {u} is now muted' + existed,
                         u=member.user,
                     ))
+                member.user.open_dm().send_message(maybe_string(
+                    reason,
+                    u'You got muted on {g} with reason: ({o})',
+                    u'You got muted on {g}',
+                    g=event.guild.name
+                ))
         else:
             raise CommandFail('invalid user')
 
