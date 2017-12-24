@@ -163,9 +163,9 @@ class UtilitiesPlugin(Plugin):
             width_offset += img.width + 10
 
         combined = BytesIO()
-        image.save(combined, 'png', quality=55)
+        image.save(combined, 'gif', quality=55)
         combined.seek(0)
-        return event.msg.reply('', attachments=[('emoji.png', combined)])
+        return event.msg.reply('', attachments=[('emoji.gif', combined)])
 
     @Plugin.command('seen', '<user:user>', global_=True)
     def seen(self, event, user):
