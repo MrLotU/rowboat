@@ -19,7 +19,8 @@ STATUS_EMOJI = {
 # Regexes
 INVITE_LINK_RE = re.compile(r'(discordapp.com/invite|discord.me|discord.gg)(?:/#)?(?:/invite)?/([a-z0-9\-]+)', re.I)
 URL_RE = re.compile(r'(https?://[^\s]+)')
-USER_MENTION_RE = re.compile('<@!?([0-9]+)>')
+EMOJI_RE = re.compile(r'<:(.+):([0-9]+)>')
+USER_MENTION_RE = re.compile(r'<@!?([0-9]+)>')
 
 # IDs and such
 ROWBOAT_GUILD_ID = 311878403986817026
