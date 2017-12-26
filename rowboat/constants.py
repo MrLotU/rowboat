@@ -21,7 +21,7 @@ INVITE_LINK_RE = re.compile(r'(discordapp.com/invite|discord.me|discord.gg)(?:/#
 URL_RE = re.compile(r'(https?://[^\s]+)')
 EMOJI_RE = re.compile(r'<:(.+):([0-9]+)>')
 AEMOJI_RE = re.compile(r'<a:(.+):([0-9+)>')
-USER_MENTION_RE = re.compile('<@!?([0-9]+)>')
+USER_MENTION_RE = re.compile(r'<@!?([0-9]+)>')
 
 # IDs and such
 ROWBOAT_GUILD_ID = 311878403986817026
