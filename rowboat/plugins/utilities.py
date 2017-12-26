@@ -26,7 +26,7 @@ from rowboat.models.user import User, Infraction
 from rowboat.models.message import Message, Reminder
 from rowboat.util.images import get_dominant_colors_user, get_dominant_colors_guild
 from rowboat.constants import (
-    AEMOJI_RE, STATUS_EMOJI, EMOJI_RE, USER_MENTION_RE, YEAR_IN_SEC, CDN_URL
+    STATUS_EMOJI, EMOJI_RE, USER_MENTION_RE, YEAR_IN_SEC, CDN_URL
 )
 
 
@@ -140,9 +140,6 @@ class UtilitiesPlugin(Plugin):
             if EMOJI_RE.match(emoji):
                 _, eid = EMOJI_RE.findall(emoji)[0]
                 urls.append('https://discordapp.com/api/emojis/{}.png'.format(eid))
-            elif AEMOJI_RE.match(emoji):
-                _, eid = AEMOJI_RE.findall(emoji)[0]
-                urls.append('https://discordapp.com/api/emojis/{}.gif'.format(eid))
             else:
                 urls.append(get_emoji_url(emoji))
 
@@ -166,9 +163,9 @@ class UtilitiesPlugin(Plugin):
             width_offset += img.width + 10
 
         combined = BytesIO()
-        image.save(combined, 'gif', quality=55)
+        image.save(combined, 'png', quality=55)
         combined.seek(0)
-        return event.msg.reply('', attachments=[('emoji.gif', combined)])
+        return event.msg.reply('', attachments=[('emoji.png', combined)])
 
     @Plugin.command('seen', '<user:user>', global_=True)
     def seen(self, event, user):
