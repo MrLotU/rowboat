@@ -168,7 +168,7 @@ class UtilitiesPlugin(Plugin):
             width_offset += img.width + 10
 
         combined = BytesIO()
-        image.save(combined, 'gif' if gif else 'png', quality=55)
+        image.save(combined, 'gif' if gif else 'png', quality=55, save_all=True)
         combined.seek(0)
         return event.msg.reply('', attachments=[('emoji.gif' if gif else 'emoji.png', combined)])
 
