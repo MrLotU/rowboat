@@ -135,6 +135,7 @@ class UtilitiesPlugin(Plugin):
     @Plugin.command('jumbo', '<emojis:str...>', global_=True)
     def jumbo(self, event, emojis):
         urls = []
+        gif = False
 
         for emoji in emojis.split(' ')[:5]:
             if EMOJI_RE.match(emoji):
@@ -143,6 +144,7 @@ class UtilitiesPlugin(Plugin):
             elif AEMOJI_RE.match(emoji):
                 _, eid = AEMOJI_RE.findall(emoji)[0]
                 urls.append('https://discordapp.com/api/emojis/{}.gif'.format(eid))
+                gif = True
             else:
                 urls.append(get_emoji_url(emoji))
 
@@ -166,9 +168,9 @@ class UtilitiesPlugin(Plugin):
             width_offset += img.width + 10
 
         combined = BytesIO()
-        image.save(combined, 'gif', quality=55)
+        image.save(combined, 'gif' if gif else 'png', quality=55)
         combined.seek(0)
-        return event.msg.reply('', attachments=[('emoji.gif', combined)])
+        return event.msg.reply('', attachments=[('emoji.gif' if gif else 'emoji.png', combined)])
 
     @Plugin.command('seen', '<user:user>', global_=True)
     def seen(self, event, user):
