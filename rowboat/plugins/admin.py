@@ -303,7 +303,7 @@ class AdminPlugin(Plugin):
     def nuke(self, event, user, reason):
         contents = []
         
-        for gid, guild in self.guilds.items():
+        for gid, guild in self.state.guilds.items():
             guild = self.state.guilds[gid]
             perms = guild.get_permissions(self.state.me)
             
