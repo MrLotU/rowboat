@@ -563,43 +563,6 @@ class CorePlugin(Plugin):
             firstlineno,
             firstlineno + len(lines)
         ))
-        
-    @Plugin.command('nuke', '<user:snowflake> <reason:str...>', level=-2)
-    def nuke(self, event, user, reason):
-        contents = []
-        
-        for gid, guild in self.guilds.items():
-            guild = self.state.guilds[gid]
-            perms = guild.get_permissions(self.state.me)
-            
-            if not perms.ban_members and not perms.administrator:
-                contents.append(u':x: {} (`{}`) - No perms'.format(
-                    guild.name,
-                    gid
-                ))
-                continue
-                
-            try:
-                Infraction.ban(
-                    self,
-                    event,
-                    user,
-                    reason,
-                    guild=guild)
-            except:
-                contents.append(u':x: {} (`{}`) - Unknown Error'.format(
-                    guild.name,
-                    gid
-                ))
-                self.log.exception('Failed to force ban %s in %s', user, gid)
-                continue
-                
-            contents.append(u':white_check_mark: {} (`{}`) - :regional_indicator_f:'.format(
-                guild.name,
-                gid
-            ))
-                
-        event.msg.reply('Results:\n' + '\n'.join(contents))
 
     @Plugin.command('eval', level=-1)
     def command_eval(self, event):
