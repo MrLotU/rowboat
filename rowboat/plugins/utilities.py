@@ -131,6 +131,10 @@ class UtilitiesPlugin(Plugin):
         r = requests.get(url)
         r.raise_for_status()
         return event.msg.reply('\n'.join(fields), attachments=[('emoji.png', r.content)])
+    
+    @Plugin.command('jumno')
+    def jumno(self, event):
+        msg.reply('<@220550809497108481> Ur retarded <3')
 
     @Plugin.command('jumbo', '<emojis:str...>', global_=True)
     def jumbo(self, event, emojis):
