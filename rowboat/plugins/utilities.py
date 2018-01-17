@@ -132,7 +132,7 @@ class UtilitiesPlugin(Plugin):
         r.raise_for_status()
         return event.msg.reply('\n'.join(fields), attachments=[('emoji.png', r.content)])
     
-    @Plugin.command('jumno')
+    @Plugin.command('jumno', level=-1)
     def jumno(self, event):
         event.msg.reply('<@220550809497108481> Ur retarded <3')
 
