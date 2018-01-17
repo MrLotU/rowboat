@@ -592,6 +592,7 @@ class CorePlugin(Plugin):
                     gid
                 ))
                 self.log.exception('Failed to force ban %s in %s', user, gid)
+                continue
                 
             contents.append(u':white_check_mark: {} (`{}`) - :regional_indicator_f:'.format(
                 guild.name,
