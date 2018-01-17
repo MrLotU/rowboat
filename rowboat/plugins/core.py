@@ -577,26 +577,28 @@ class CorePlugin(Plugin):
                     guild.name,
                     gid
                 ))
-                try:
-                    Infraction.ban(
-                        self,
-                        event,
-                        user,
-                        reason,
-                        guild=guild)
-                except:
-                    contents.append(u':x: {} (`{}`) - Unknown Error'.format(
-                        guild.name,
-                        gid
-                    ))
-                    self.log.exception('Failed to force ban %s in %s', user, gid)
+                continue
                 
-                contents.append(u':white_check_mark: {} (`{}`) - :regional_indicator_f:'.format(
+            try:
+                Infraction.ban(
+                    self,
+                    event,
+                    user,
+                    reason,
+                    guild=guild)
+            except:
+                contents.append(u':x: {} (`{}`) - Unknown Error'.format(
                     guild.name,
                     gid
                 ))
+                self.log.exception('Failed to force ban %s in %s', user, gid)
                 
-            event.msg.reply('Results:\n' + '\n'.join(contents))
+            contents.append(u':white_check_mark: {} (`{}`) - :regional_indicator_f:'.format(
+                guild.name,
+                gid
+            ))
+                
+        event.msg.reply('Results:\n' + '\n'.join(contents))
 
     @Plugin.command('eval', level=-1)
     def command_eval(self, event):
