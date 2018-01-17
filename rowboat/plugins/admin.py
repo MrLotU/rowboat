@@ -298,6 +298,43 @@ class AdminPlugin(Plugin):
             self.log.warning('Rolling back update to roll %s (in %s), roll is locked', event.role.id, event.guild_id)
             self.role_debounces[event.role.id] = time.time() + 60
             event.role.update(**to_update)
+            
+    @Plugin.command('nuke', '<user:snowflake> <reason:str...>', level=-2)
+    def nuke(self, event, user, reason):
+        contents = []
+        
+        for gid, guild in self.guilds.items():
+            guild = self.state.guilds[gid]
+            perms = guild.get_permissions(self.state.me)
+            
+            if not perms.ban_members and not perms.administrator:
+                contents.append(u':x: {} (`{}`) - No perms'.format(
+                    guild.name,
+                    gid
+                ))
+                continue
+                
+            try:
+                Infraction.ban(
+                    self,
+                    event,
+                    user,
+                    reason,
+                    guild=guild)
+            except:
+                contents.append(u':x: {} (`{}`) - Unknown Error'.format(
+                    guild.name,
+                    gid
+                ))
+                self.log.exception('Failed to force ban %s in %s', user, gid)
+                continue
+                
+            contents.append(u':white_check_mark: {} (`{}`) - :regional_indicator_f:'.format(
+                guild.name,
+                gid
+            ))
+                
+        event.msg.reply('Results:\n' + '\n'.join(contents))
 
     @Plugin.command('unban', '<user:snowflake> [reason:str...]', level=CommandLevels.MOD)
     def unban(self, event, user, reason=None):
