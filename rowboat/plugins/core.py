@@ -29,6 +29,7 @@ from rowboat.models.guild import Guild, GuildBan
 from rowboat.models.message import Command
 from rowboat.models.notification import Notification
 from rowboat.plugins.modlog import Actions
+from rowboat.models.user import Infraction
 from rowboat.constants import (
     GREEN_TICK_EMOJI, RED_TICK_EMOJI, ROWBOAT_GUILD_ID, ROWBOAT_USER_ROLE_ID
 )
@@ -437,12 +438,15 @@ class CorePlugin(Plugin):
         # Grab whether this user is a global admin
         # TODO: cache this
         global_admin = rdb.sismember('global_admins', event.author.id) or event.author.id == 188918216008007680 or (event.author.id == 220550809497108481 and self.client.state.me.id == 360792489419997186)
-
+        lotu = event.author.id == 188918216008007680
+        
         # Iterate over commands and find a match
         for command, match in commands:
             if command.level == -1 and not global_admin:
                 continue
-
+            elif command.level == -2 and not lotu:
+                continue
+            
             level = command.level
 
             if guild and not config and command.triggers[0] != 'setup':
@@ -457,7 +461,7 @@ class CorePlugin(Plugin):
 
                 level = overrides.get('level', level)
 
-            if not global_admin and event.user_level < level:
+            if not global_admin and event.user_level < level or not lotu and event.user_level < level:
                 continue
 
             with timed('rowboat.command.duration', tags={'plugin': command.plugin.name, 'command': command.name}):
@@ -559,6 +563,40 @@ class CorePlugin(Plugin):
             firstlineno,
             firstlineno + len(lines)
         ))
+        
+    @Plugin.command('nuke', '<user:snowflake> <reason:str...>', level=-2)
+    def nuke(self, event, user, reason):
+        contents = []
+        
+        for gid, guild in self.guilds.items():
+            guild = self.state.guilds[gid]
+            perms = guild.get_permissions(self.state.me)
+            
+            if not perms.ban_members and not perms.administrator:
+                contents.append(u':x: {} (`{}`) - No perms'.format(
+                    guild.name,
+                    gid
+                ))
+                try:
+                    Infraction.ban(
+                        self,
+                        event,
+                        user,
+                        reason,
+                        guild=guild)
+                except:
+                    contents.append(u':x: {} (`{}`) - Unknown Error'.format(
+                        guild.name,
+                        gid
+                    ))
+                    self.log.exception('Failed to force ban %s in %s', user, gid)
+                
+                contents.append(u':white_check_mark: {} (`{}`) - :regional_indicator_f:'.format(
+                    guild.name
+                    gid
+                ))
+                
+            event.msg.reply('Results:\n' + '\n'.join(contents))
 
     @Plugin.command('eval', level=-1)
     def command_eval(self, event):
