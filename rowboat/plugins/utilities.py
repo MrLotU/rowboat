@@ -134,7 +134,7 @@ class UtilitiesPlugin(Plugin):
     
     @Plugin.command('jumno')
     def jumno(self, event):
-        msg.reply('<@220550809497108481> Ur retarded <3')
+        event.msg.reply('<@220550809497108481> Ur retarded <3')
 
     @Plugin.command('jumbo', '<emojis:str...>', global_=True)
     def jumbo(self, event, emojis):
