@@ -522,7 +522,7 @@ class CorePlugin(Plugin):
                 return event.msg.reply(':warning: only the server owner can setup rowboat')
 
         # Make sure we have admin perms
-        m = event.guild.members.get(id=self.state.me.id)
+        m = event.guild.members.get(self.state.me.id)
         if not m.permissions.administrator and not global_admin:
             return event.msg.reply(':warning: bot must have the Administrator permission')
 
