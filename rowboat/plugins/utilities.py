@@ -92,25 +92,25 @@ class UtilitiesPlugin(Plugin):
 
         event.msg.reply(str(random.randint(start, end)))
 
-    @Plugin.command('cat', global_=True)
+    @Plugin.command('dog', global_=True)
     def cat(self, event):
         # Sometimes random.cat gives us gifs (smh)
         for _ in range(3):
             try:
-                r = requests.get('http://random.cat/meow')
+                r = requests.get('http://random.dog/woof.json')
                 r.raise_for_status()
             except:
                 continue
 
-            url = r.json()['file']
-            if not url.endswith('.gif'):
+            url = r.json()['url']
+            if not url.endswith('.gif') or url.endswith('.mp4'):
                 break
         else:
-            return event.msg.reply('404 cat not found :(')
+            return event.msg.reply('404 dog not found :(')
 
         r = requests.get(url)
         r.raise_for_status()
-        event.msg.reply('', attachments=[('cat.jpg', r.content)])
+        event.msg.reply('', attachments=[('dog.jpg', r.content)])
 
     @Plugin.command('emoji', '<emoji:str>', global_=True)
     def emoji(self, event, emoji):
