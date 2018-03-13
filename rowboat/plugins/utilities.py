@@ -110,7 +110,10 @@ class UtilitiesPlugin(Plugin):
 
         r = requests.get(url)
         r.raise_for_status()
-        event.msg.reply('', attachments=[('dog.jpg', r.content)])
+        try:
+            event.msg.reply('', attachments=[('dog.jpg', r.content)])
+        except:
+            event.msg.reply('Dog overwhelming! Try again!')
 
     @Plugin.command('emoji', '<emoji:str>', global_=True)
     def emoji(self, event, emoji):
